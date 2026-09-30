@@ -525,3 +525,41 @@ svg.chart .grid-line { stroke: var(--border-soft); stroke-width: 1; }
 .countdown { font-family: var(--mono); font-size: 12px; }
 .countdown.soon { color: var(--warn); }
 .countdown.now { color: var(--bad); }
+
+/* ==========================================================================
+   纠删码（Erasure Coding）：分片卡片 / 策略弹窗 / 矩阵列
+   ========================================================================== */
+.ec-shard {
+  flex: 1 1 78px; min-width: 78px;
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 7px 9px; background: var(--bg-soft);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.ec-shard .es-idx { font-family: var(--mono); font-weight: 700; font-size: 12.5px; }
+.ec-shard .es-node {
+  font-family: var(--mono); font-size: 11.5px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ec-shard.ok { border-color: rgba(47,191,113,.4); }
+.ec-shard.ok .es-idx { color: var(--ok); }
+.ec-shard.recovering { border-color: rgba(240,165,56,.55); background: var(--warn-soft); }
+.ec-shard.recovering .es-idx { color: var(--warn); }
+.ec-shard.missing { border-color: rgba(229,83,75,.55); background: var(--bad-soft); }
+.ec-shard.missing .es-idx { color: var(--bad); }
+
+.prof-opt { display: flex; flex-direction: column; gap: 10px; }
+.prof-line, .prof-card {
+  display: flex; gap: 10px; align-items: flex-start;
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+  cursor: pointer;
+}
+.prof-line.sel, .prof-card.sel {
+  border-color: var(--accent); background: var(--accent-soft);
+}
+.prof-card.nofit { opacity: .55; cursor: not-allowed; }
+.prof-card { margin-bottom: 6px; }
+.prof-line input, .prof-card input { margin-top: 3px; }
+
+td.c-data { color: var(--ok); }
+td.c-parity { color: #b78cff; }
+.kpi.violet .k-value { color: #b78cff; }

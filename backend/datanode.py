@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import config
+from . import erasure
 from .util import (RateCounter, atomic_write_json, b64e, gen_id, http_json,
                    http_request, now, parse_range, read_json, sha256_bytes,
                    to_rate_units, vv_compare, vv_merge, content_range_value,
@@ -337,6 +338,72 @@ class DataNode:
                          "size": len(data)})
         return True
 
+    def ec_rebuild(self, cmd):
+        """
+        纠删码分片重建（恢复流程执行端）：
+          1. 从 sources 列出的存活节点各拉一个分片（带校验和验证），
+             凑齐任意 k 个；
+          2. Reed-Solomon 本地重算出本节点负责的 assignments 分片；
+          3. 逐个落盘并上报 replicate_done（携带 group/indexes）。
+        """
+        from .util import http_request as _http_request
+        gid = cmd.get("group")
+        k, m = cmd.get("k"), cmd.get("m")
+        try:
+            available = {}
+            errors = []
+            for src in cmd.get("sources", []):
+                if len(available) >= k:
+                    break
+                idx = src["index"]
+                if idx in available:
+                    continue
+                try:
+                    _st, _hdrs, data = _http_request(
+                        src["url"], "GET", timeout=20,
+                        headers={"X-Cluster-Key": self.cluster_key})
+                    if src.get("checksum") and \
+                            sha256_bytes(data) != src["checksum"]:
+                        raise DataNodeError("源分片校验和不匹配")
+                    available[idx] = data
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"#{idx}@{src.get('node')}:{e}")
+            if len(available) < k:
+                raise DataNodeError(
+                    f"仅获取 {len(available)}/{k} 个源分片: {errors[:3]}")
+            want = {a["index"] for a in cmd.get("assignments", [])}
+            rebuilt = erasure.reconstruct(available, k, m, want=want)
+            done_indexes = []
+            for a in cmd.get("assignments", []):
+                idx = a["index"]
+                data = rebuilt[idx]
+                self.store_block(a["block_id"], data, a.get("genstamp", 1),
+                                 a.get("checksum"), a.get("size"))
+                done_indexes.append(idx)
+                with self._state_lock:
+                    self.io["replicate_in"] += 1
+                self.push_event({
+                    "type": "replicate_done", "block_id": a["block_id"],
+                    "genstamp": a.get("genstamp", 1),
+                    "checksum": a.get("checksum"),
+                    "size": a.get("size"),
+                    "indexes": [idx],
+                })
+            self.push_event({
+                "type": "ec_rebuild_report", "group": gid,
+                "indexes": done_indexes, "node": self.node_id})
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.push_event({
+                "type": "replicate_failed",
+                "block_id": (cmd.get("assignments") or [{}])[0]
+                .get("block_id", ""),
+                "indexes": [a["index"] for a in cmd.get("assignments", [])],
+                "group": gid,
+                "reason": f"EC 重建失败: {e}",
+            })
+            return False
+
     def forward_block(self, bid, data, genstamp, checksum, forward_urls):
         """
         流水线转发：把块 PUT 给链上下一个节点（携带剩余转发列表）。
@@ -419,6 +486,12 @@ class DataNode:
                     args=(cmd["block_id"], cmd["src"], cmd.get("genstamp", 1),
                           cmd.get("checksum"), cmd.get("size")),
                     name=f"repl-{cmd['block_id'][-6:]}", daemon=True)
+                t.start()
+            elif ctype == "ec_rebuild":
+                t = threading.Thread(
+                    target=self.ec_rebuild, args=(cmd,),
+                    name=f"ec-rebuild-{cmd.get('group', '')[-6:]}",
+                    daemon=True)
                 t.start()
             elif ctype == "delete":
                 self.delete_block(cmd["block_id"],

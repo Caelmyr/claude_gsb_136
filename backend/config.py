@@ -73,6 +73,30 @@ GENSTAMP_INITIAL = 1                   # 块版本号（generation stamp）初�
 RECOVERY_TRIGGER = "min"               # 恢复队列触发口径
 
 # ----------------------------------------------------------------------------
+# 纠删码（Erasure Coding，第二种冗余：数据分片 + 校验分片）
+# ----------------------------------------------------------------------------
+# 存储策略名（目录 inode.storage_policy / 文件 inode.storage）
+POLICY_REPLICA = "replica"             # 三副本（默认）
+POLICY_EC = "ec"                       # 纠删码
+DEFAULT_STORAGE_POLICY = POLICY_REPLICA
+
+# 纠删码方案表：profile -> {k 数据分片, m 校验分片, label, desc}
+# 任意 m 个分片损坏都能由其余任意 k 个分片还原；空间开销 1 + m/k。
+EC_PROFILES = {
+    "ec-2+1": {"k": 2, "m": 1, "label": "EC 2+1",
+               "desc": "2 数据 + 1 校验，容忍 1 分片丢失，开销 ×1.5（3 节点即可）"},
+    "ec-4+2": {"k": 4, "m": 2, "label": "EC 4+2",
+               "desc": "4 数据 + 2 校验，容忍 2 分片丢失，开销 ×1.5（需 6 节点）"},
+    "ec-6+3": {"k": 6, "m": 3, "label": "EC 6+3",
+               "desc": "6 数据 + 3 校验，容忍 3 分片丢失，开销 ×1.5（需 9 节点）"},
+}
+EC_DEFAULT_PROFILE = "ec-2+1"          # 目录选 EC 但未指定方案时的默认
+EC_CELL_SIZE = 128 * 1024              # 编解码单元（条带单元）大小
+EC_GROUP_MAX_DATA = 4 * 1024 * 1024    # 单个 EC 组最多承载的数据字节数（超过则多组）
+EC_RECOVERY_TIMEOUT = 45.0             # 分片重建命令超时（秒），超时重排
+EC_MAX_REBUILDING_GROUPS = 16          # 同时重建的 EC 组上限
+
+# ----------------------------------------------------------------------------
 # 心跳 / 汇报 / 巡检 / 恢复（难点二：故障检测与自动恢复）
 # ----------------------------------------------------------------------------
 HEARTBEAT_INTERVAL = 1.5               # DataNode 心跳间隔（秒）
@@ -93,8 +117,9 @@ TRASH_EXPIRE_CHECK_INTERVAL = 60.0     # 回收站过期清理检查间隔（秒
 # ----------------------------------------------------------------------------
 # 元数据集中存储：每个文档一个 JSON 文件，原子写（tmp + fsync + os.replace）
 META_DOCS = [
-    "fs",          # 文件系统 inode 树（目录/文件/回收站挂载点）
-    "blocks",      # 块表：块 -> 校验和 / genstamp / 副本位置
+    "fs",          # 文件系统 inode 树（目录/文件/回收站挂载点/目录存储策略）
+    "blocks",      # 块表：块 -> 校验和 / genstamp / 副本位置（含 EC 分片块）
+    "ec_groups",   # 纠删码组表：组 -> k/m/分片索引->块/填充/重建进度
     "versions",    # 版本树：commit DAG / 分支 / HEAD
     "users",       # 用户与凭据
     "perms",       # 权限规则（ACL）
@@ -180,7 +205,8 @@ LOG_MAX_ENTRIES = 5000                  # logs.json 中最多保留的条数
 LOG_LEVELS = ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
 LOG_LEVEL_SEP = "|"                     # 日志级别多选过滤的分隔符
 LOG_SOURCES = ["namenode", "datanode", "api", "auth", "fs", "block", "version",
-               "recovery", "gc", "sync", "upload", "download", "sim"]
+               "recovery", "gc", "sync", "upload", "download", "sim",
+               "ec"]
 
 # ----------------------------------------------------------------------------
 # 演示 / 模拟

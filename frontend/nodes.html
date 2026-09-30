@@ -35,13 +35,23 @@
 
     <section class="content">
       <!-- 汇总 -->
-      <div class="grid cols-5" id="sum-row" style="margin-bottom:16px"></div>
+      <div class="grid" id="sum-row" style="grid-template-columns:repeat(7,1fr);margin-bottom:16px"></div>
 
       <!-- 节点卡片 -->
       <div class="grid cols-3" id="node-cards" style="margin-bottom:16px"></div>
 
       <div class="split-view">
         <div class="side grow">
+          <!-- 纠删码组（数据分片/校验分片分布 + 自动修复进度） -->
+          <div class="card">
+            <div class="card-title">纠删码组（EC） <span class="hint">数据分片 + 校验分片 · 任意 k 个分片即可还原 · 损坏自动重建</span>
+              <span class="spacer"></span>
+              <span class="small muted" id="ec-hint"></span>
+              <button class="btn xs ghost" id="ec-refresh">⟳</button>
+            </div>
+            <div id="ec-box"></div>
+          </div>
+
           <!-- 副本分布矩阵 -->
           <div class="card">
             <div class="card-title">副本分布矩阵 <span class="hint">块 × 节点（问题块优先展示）· 点击单元格可注入损坏</span>
@@ -93,12 +103,15 @@ async function loadNodes() {
 
 function renderSummary(d) {
   const h = d.health;
+  const ec = h.ec_groups || {};
   const cells = [
     { label: "节点", value: `${d.summary.live}/${d.summary.total}`, sub: `DEAD ${d.summary.dead} · SUSPECT ${d.summary.suspect}`, cls: d.summary.dead ? "bad" : "ok" },
-    { label: "欠副本块", value: h.under_replicated, sub: "低于期望副本数", cls: h.under_replicated ? "warn" : "ok" },
+    { label: "欠副本块", value: h.under_replicated, sub: "三副本低于期望", cls: h.under_replicated ? "warn" : "ok" },
     { label: "损坏副本", value: h.corrupt_replicas, sub: "校验和不匹配", cls: h.corrupt_replicas ? "bad" : "ok" },
-    { label: "丢失块", value: h.missing_blocks, sub: "无任何可用副本", cls: h.missing_blocks ? "bad" : "ok" },
-    { label: "调度中", value: h.scheduled, sub: "已下发复制命令", cls: h.scheduled ? "accent" : "" },
+    { label: "EC 组", value: ec.total ?? 0, sub: "纠删码条带组", cls: "" },
+    { label: "EC 降级", value: ec.degraded ?? 0, sub: "分片缺失·可读可修", cls: ec.degraded ? "warn" : "ok" },
+    { label: "EC 危急", value: ec.critical ?? 0, sub: "可用分片 < k", cls: ec.critical ? "bad" : "ok" },
+    { label: "EC 修复中", value: ec.rebuilding ?? 0, sub: "分片重建任务", cls: ec.rebuilding ? "accent" : "" },
   ];
   document.getElementById("sum-row").innerHTML = cells.map(c => `
     <div class="kpi ${c.cls}">
@@ -130,7 +143,7 @@ function renderCards(d) {
         <i style="width:${pct}%"></i></div>
       <div class="node-kv">
         <span class="k">容量</span><span class="v">${fmtBytes(st.used)} / ${fmtBytes(st.capacity)}（${pct.toFixed(1)}%）</span>
-        <span class="k">块数</span><span class="v">${n.nn_block_count}（表内） · 损坏 ${n.corrupt}</span>
+        <span class="k">块数</span><span class="v">${n.nn_block_count}（表内）· 其中 EC 分片 ${n.nn_ec_shards || 0} · 损坏 ${n.corrupt}</span>
         <span class="k">心跳</span><span class="v">${n.state === "DEAD" ? `<span style="color:var(--bad)">失联 ${silent.toFixed(1)}s</span>` : silent.toFixed(1) + "s 前"} · 共 ${n.hb_count} 次</span>
         <span class="k">IO</span><span class="v">读 ${(n.io.reads || 0)} / 写 ${(n.io.writes || 0)} · ${fmtBytes((n.rates || {}).read || 0)}/s ↗ ${(n.rates || {}).write ? fmtBytes(n.rates.write) : "0"}/s</span>
         <span class="k">复制</span><span class="v">流入 ${n.io.replicate_in || 0} · 流出 ${n.io.replicate_out || 0} · 巡检 ${n.io.scrubbed || 0}</span>
@@ -230,19 +243,106 @@ async function loadMatrix() {
 }
 document.getElementById("matrix-refresh").onclick = loadMatrix;
 
+// ------------------------------------------------------------------ 纠删码组
+async function loadEcGroups() {
+  const d = await api("GET", "/api/ec/groups?limit=200");
+  document.getElementById("ec-hint").textContent =
+    `共 ${d.counts.total} 组 · 降级 ${d.counts.degraded} · 修复中 ${d.counts.rebuilding}`;
+  const box = document.getElementById("ec-box");
+  if (!d.groups.length) {
+    box.innerHTML = `<div class="empty small">暂无纠删码文件（在文件浏览页对目录切换「🔀 冗余策略」为纠删码后上传）</div>`;
+    return;
+  }
+  // 问题组优先
+  const order = { critical: 0, degraded: 1, healthy: 2 };
+  const groups = d.groups.slice().sort((a, b) => order[a.status] - order[b.status]);
+  box.innerHTML = `
+    <div class="table-wrap scroll-y" style="max-height:380px">
+    <table class="tbl"><thead><tr>
+      <th>组</th><th>方案</th><th>数据量</th><th>分片分布（D=数据 / P=校验）</th>
+      <th>状态</th><th>自动修复进度</th><th>引用文件</th>
+    </tr></thead><tbody>
+    ${groups.map(g => {
+      const rb = g.rebuild;
+      const done = (rb?.done || []).length;
+      const total = rb?.missing_total || 1;
+      const pct = Math.round(done / Math.max(1, total) * 100);
+      const recNodes = Object.values(rb?.recovering || {}).map(x => x.node);
+      return `
+      <tr>
+        <td class="mono small">${esc(g.short)}</td>
+        <td><span class="badge violet plain">${esc(g.profile)}</span></td>
+        <td class="small">${fmtBytes(g.data_len)}<br><span class="muted">分片 ${fmtBytes(g.shard_size)}</span></td>
+        <td>${renderEcShardCells(g)}</td>
+        <td>${g.status === "healthy" ? '<span class="badge ok plain">健康</span>' :
+              g.status === "degraded" ? '<span class="badge warn plain">降级</span>' :
+              '<span class="badge bad plain">危急</span>'}
+            <span class="mono small">${g.available}/${g.k + g.m}</span></td>
+        <td style="min-width:170px">
+          ${rb ? `
+            <div class="pbar thin ${g.status === "critical" ? "bad" : "warn"}" style="margin-bottom:3px">
+              <i style="width:${pct}%"></i></div>
+            <div class="small mono">${esc(rb.progress || `${done}/${total}`)}
+              ${recNodes.length ? `→ ${esc(recNodes.join(","))}` : ""}</div>
+            ${rb.last_error ? `<div class="small bad">${esc(rb.last_error)}</div>` : ""}`
+            : (g.status === "degraded" ? '<span class="small muted">等待调度…</span>' : '<span class="small muted">—</span>')}
+        </td>
+        <td class="small">${(g.paths || []).slice(0, 2).map(p =>
+          `<div class="mono" style="max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p)}">🗎 ${esc(p)}</div>`).join("") || '<span class="muted">无活动引用</span>'}</td>
+      </tr>`;
+    }).join("")}
+    </tbody></table></div>`;
+}
+
+// 从组视图的 shards 明细构造 D/P 分布（组视图无 shards 时回退为节点列表）
+function renderEcShardCells(g) {
+  if (!g.shards) return `<span class="small muted">${esc((g.nodes || []).join(" · "))}</span>`;
+  return `<div style="display:flex;gap:4px;flex-wrap:wrap">${g.shards.map(sh => {
+    const label = sh.kind === "data" ? `D${sh.index}` : `P${sh.index - g.k}`;
+    const cls = sh.state === "ok" ? "ok"
+      : (g.recovering && g.recovering[String(sh.index)]) ? "warn" : "bad";
+    const node = sh.state === "ok" ? esc(sh.nodes.join(","))
+      : (g.recovering && g.recovering[String(sh.index)]
+         ? "→" + esc(g.recovering[String(sh.index)].node) : "缺失");
+    const color = sh.kind === "data" ? "var(--ok)" : "#b78cff";
+    return `<span class="badge plain ${cls}" style="font-family:var(--mono);font-size:11px"
+             title="${sh.kind === "data" ? "数据分片" : "校验分片"} #${sh.index} · ${esc(sh.checksum)}…">
+      <b style="color:${color}">${label}</b> ${node}</span>`;
+  }).join("")}</div>`;
+}
+document.getElementById("ec-refresh").onclick = loadEcGroups;
+
 // ------------------------------------------------------------------ 恢复队列
 async function loadQueue() {
   const q = await api("GET", "/api/health/queue");
   const box = document.getElementById("queue-box");
   const under = q.under_replicated;
   const corrupt = Object.entries(q.corrupt);
+  const ecg = q.ec_groups || [];
   box.innerHTML = `
     <div class="small" style="margin-bottom:8px">
       <span class="badge ${under.length ? "warn" : "ok"}">欠副本 ${q.counts.under}</span>
       <span class="badge ${corrupt.length ? "bad" : "ok"}">损坏 ${q.counts.corrupt}</span>
       <span class="badge ${q.counts.missing ? "bad" : "ok"}">丢失 ${q.counts.missing}</span>
-      <span class="badge ${q.counts.scheduled ? "acc" : "dim"}">调度中 ${q.counts.scheduled}</span>
+      <span class="badge ${q.counts.ec_degraded ? "warn" : "ok"}">EC 降级 ${q.counts.ec_degraded ?? 0}</span>
+      <span class="badge ${q.counts.ec_critical ? "bad" : "ok"}">EC 危急 ${q.counts.ec_critical ?? 0}</span>
+      <span class="badge ${q.counts.ec_rebuilding ? "acc" : "dim"}">EC 修复中 ${q.counts.ec_rebuilding ?? 0}</span>
     </div>
+    ${ecg.length ? `
+    <div class="table-wrap scroll-y" style="max-height:240px;margin-bottom:8px">
+    <table class="tbl"><thead><tr><th>EC 组</th><th>方案</th><th>分片</th><th>修复进度</th></tr></thead>
+    <tbody>${ecg.map(g => {
+      const rb = g.rebuild;
+      const done = (rb?.done || []).length, total = rb?.missing_total || 1;
+      return `<tr>
+        <td class="mono small">${esc(g.short)}</td>
+        <td><span class="badge violet plain">${esc(g.profile)}</span></td>
+        <td><span class="badge ${g.status === "critical" ? "bad" : "warn"} plain">${g.available}/${g.k + g.m}</span></td>
+        <td class="small mono">${rb ? esc(rb.progress || `${done}/${total}`)
+          + " → " + esc(Object.values(rb.recovering || {}).map(x => x.node).join(","))
+          : '<span class="muted">等待调度</span>'}</td>
+      </tr>`;
+    }).join("")}</tbody></table></div>` : ""}
     ${under.length ? `
     <div class="table-wrap scroll-y" style="max-height:220px">
     <table class="tbl"><thead><tr><th>块</th><th>副本</th><th class="right">大小</th><th>发现于</th><th>尝试</th><th>调度</th></tr></thead>
@@ -254,7 +354,8 @@ async function loadQueue() {
         <td class="small dim">${fmtAgo(u.since)}</td>
         <td class="num">${u.attempts}</td>
         <td class="small mono">${u.scheduled ? `${esc(u.scheduled.src)} → ${esc((u.scheduled.dst || []).join(","))}` : '<span class="muted">待调度</span>'}</td>
-      </tr>`).join("")}</tbody></table></div>` : '<div class="empty small">队列清空：所有块副本齐全 🎉</div>'}
+      </tr>`).join("")}</tbody></table></div>`
+      : (!ecg.length ? '<div class="empty small">队列清空：副本与纠删码分片均健康 🎉</div>' : "")}
     ${corrupt.length ? `<div class="small" style="margin-top:10px">
       ${corrupt.map(([k, v]) => `<span class="badge bad plain" title="${esc(v.reason || "")} · ${fmtTs(v.ts)}">${esc(k.slice(-16))}</span>`).join(" ")}</div>` : ""}`;
 }
@@ -287,8 +388,9 @@ initPage("nodes.html", "节点状态").then(async () => {
   const tick = () => Promise.all([loadNodes(), loadQueue()])
     .catch(e => console.warn(e));
   await tick();
-  await Promise.all([loadMatrix(), loadEvents()]).catch(() => {});
+  await Promise.all([loadMatrix(), loadEcGroups(), loadEvents()]).catch(() => {});
   DFSVS.poll(tick, 2500);
+  DFSVS.poll(loadEcGroups, 2500);
   DFSVS.poll(loadEvents, 2000);
   DFSVS.poll(loadMatrix, 6000);
 });

@@ -155,10 +155,14 @@ class VirtualFS:
 
     # ---------------------------------------------------------------- 文件
     def create_file(self, path, name, size, content_hash, block_ids, mime,
-                    owner="admin"):
+                    owner="admin", storage=None, ec_groups=None,
+                    ec_profile=None):
         """
         创建或覆盖文件 inode（块已由 NameNode 分配并复制完成）。
         覆盖时替换 block_ids——旧块若无任何版本引用，将由 GC 回收。
+
+        storage: "replica"（三副本，默认）/ "ec"（纠删码）；
+        ec_groups: EC 文件的纠删码组 id 列表（顺序对应块序列）。
         """
         name = safe_name(name)
         with self.meta.lock:
@@ -167,6 +171,7 @@ class VirtualFS:
                 raise FsError(f"父路径不是目录: {path}")
             existing = self._child_by_name(parent, name)
             ts = now()
+            storage = storage or "replica"
             if existing:
                 if existing["type"] != "file":
                     raise FsError(f"同名目录已存在: {name}")
@@ -174,6 +179,13 @@ class VirtualFS:
                 existing["content_hash"] = content_hash
                 existing["block_ids"] = block_ids
                 existing["mime"] = mime
+                existing["storage"] = storage
+                if storage == "ec":
+                    existing["ec_groups"] = list(ec_groups or [])
+                    existing["ec_profile"] = ec_profile
+                else:
+                    existing.pop("ec_groups", None)
+                    existing.pop("ec_profile", None)
                 existing["modified_at"] = ts
                 existing["file_version"] = existing.get("file_version", 1) + 1
                 self._touch_dir_mtime(parent)
@@ -188,7 +200,11 @@ class VirtualFS:
                 "content_hash": content_hash, "mime": mime,
                 "file_version": 1,
                 "access_count": 0, "last_access": None,
+                "storage": storage,
             }
+            if storage == "ec":
+                inode["ec_groups"] = list(ec_groups or [])
+                inode["ec_profile"] = ec_profile
             self._inodes()[inode["id"]] = inode
             parent["children"].append(inode["id"])
             self._touch_dir_mtime(parent)
@@ -297,11 +313,16 @@ class VirtualFS:
             "content_hash": inode.get("content_hash"),
             "access_count": inode.get("access_count", 0),
             "last_access": inode.get("last_access"),
+            "storage": inode.get("storage", "replica"),
+            "ec_profile": inode.get("ec_profile"),
+            "ec_groups": inode.get("ec_groups", []),
             "blocks": len(inode.get("block_ids", [])),
             "thumb": bool(inode.get("mime", "").startswith("image/")),
         }
         if inode["type"] == "dir":
             info["children"] = len(inode.get("children", []))
+            info["storage_policy"] = inode.get("storage_policy")
+            info["ec_profile"] = inode.get("ec_profile")
             stats = self.dir_stats(inode)
             info["size"] = stats["bytes"]
             info["files"] = stats["files"]
@@ -337,7 +358,11 @@ class VirtualFS:
                     "mime": node.get("mime", ""),
                     "modified_at": node.get("modified_at"),
                     "blocks": len(node.get("block_ids", [])),
+                    "storage": node.get("storage", "replica"),
+                    "ec_profile": node.get("ec_profile"),
                 }
+                if node["type"] == "dir":
+                    item["storage_policy"] = node.get("storage_policy")
                 if node["type"] == "dir" and depth < max_depth:
                     kids = []
                     for cid in node.get("children", []):

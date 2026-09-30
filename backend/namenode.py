@@ -29,7 +29,7 @@ import os
 import random
 import threading
 
-from . import chunking, config
+from . import chunking, config, erasure
 from .auth import AuthManager, PermissionManager
 from .filesystem import FsError, VirtualFS
 from .metadata import MetadataStore
@@ -83,6 +83,10 @@ class NameNode:
         self.corrupt_replicas = {}       # (bid, node) -> info
         self.missing_blocks = set()      # 无任何存活好副本
         self.scheduled = {}              # bid -> {"src","dst","at"}
+        # ---- 纠删码（EC）组健康状态 ----
+        self.ec_degraded = set()         # 可用分片 < k+m 但仍 >= k
+        self.ec_critical = set()         # 可用分片 < k（再坏就丢数据）
+        self.ec_rebuilding = {}          # gid -> {"targets":[n],"at":ts}
         self.health_lock = threading.RLock()
 
         # ---- 运行态 ----
@@ -107,6 +111,7 @@ class NameNode:
         self.perms.ensure_seed()
         self.versions.ensure_head()
         self._init_blocks_doc()
+        self._init_ec_doc()
         self._init_stats_doc()
         self.meta.start_flusher()
 
@@ -120,6 +125,9 @@ class NameNode:
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
             self._threads.append(t)
+
+        # 启动后做一次 EC 组全量健康评估（恢复上次运行中的重建状态）
+        self._rescan_ec_groups()
 
         if with_http:
             from .http_server import start_namenode_server
@@ -147,6 +155,12 @@ class NameNode:
             blocks.setdefault("by_checksum", {})     # 内容去重索引
             blocks.setdefault("next_genstamp", 1000)
             self.meta.touch("blocks", flush=False)
+
+    def _init_ec_doc(self):
+        with self.meta.lock:
+            ec = self.meta.get("ec_groups")
+            ec.setdefault("groups", {})
+            self.meta.touch("ec_groups", flush=False)
 
     def _init_stats_doc(self):
         with self.meta.lock:
@@ -278,6 +292,7 @@ class NameNode:
             "doc_vv": {},
             "deaths": 0,
             "killed_flag": False,
+            "ec_report_due": True,
         }
         self.nodes[node_id] = node
         # 注意：不在 node_lock 内调用 _update_cluster_doc（锁序 meta > node），
@@ -290,6 +305,9 @@ class NameNode:
 
     def _on_node_revived(self, node):
         node_id = node["node_id"]
+        with self.node_lock:
+            self.nodes[node_id]["revived_at"] = now()
+            self.nodes[node_id]["ec_report_due"] = True
         self.log_event("INFO", "recovery", "node_revived", node_id, "system",
                        f"节点 {node_id} 恢复心跳，重新标记 LIVE，要求全量块汇报")
         self.emit("node_revived", f"节点 {node_id} 复活", node=node_id)
@@ -316,18 +334,26 @@ class NameNode:
     def _handle_node_failure(self, dead_node):
         """节点故障：其上的副本全部失效，低于期望副本数的块进入恢复队列。"""
         affected = 0
+        ec_affected = set()
         with self.meta.lock:
             blocks = self.meta.get("blocks")["blocks"]
             for bid, blk in blocks.items():
                 reps = blk.get("replicas", {})
                 if dead_node in reps:
-                    affected += 1
-                    self.check_block_health(bid)
+                    gid = blk.get("ec_group")
+                    if gid:
+                        ec_affected.add(gid)
+                    else:
+                        affected += 1
+                        self.check_block_health(bid)
+        for gid in ec_affected:
+            self.check_ec_group(gid)
         self.emit("recovery_start",
-                  f"节点 {dead_node} 故障波及 {affected} 个块，开始再复制",
-                  node=dead_node, affected=affected)
+                  f"节点 {dead_node} 故障波及 {affected} 个副本块、"
+                  f"{len(ec_affected)} 个纠删码组，开始自动修复",
+                  node=dead_node, affected=affected, ec_groups=len(ec_affected))
         self.log_event("WARN", "recovery", "failure_scan", dead_node, "system",
-                       f"故障扫描：{affected} 个块受影响")
+                       f"故障扫描：{affected} 个副本块 / {len(ec_affected)} 个 EC 组受影响")
 
     def _liveness_loop(self):
         while not self._stop.is_set():
@@ -348,38 +374,68 @@ class NameNode:
         etype = event.get("type")
         if etype == "replicate_done":
             bid = event.get("block_id")
+            gid = None
             with self.meta.lock:
                 blk = self.meta.get("blocks")["blocks"].get(bid)
                 if blk:
-                    self._record_replica(bid, blk, node_id,
-                                         event.get("genstamp", blk["genstamp"]),
-                                         event.get("checksum", blk["checksum"]),
-                                         event.get("size", blk["size"]), "ok")
-                    self.meta.touch("blocks", flush=False)
+                    gid = blk.get("ec_group")
+                    if gid:
+                        # EC 分片重建完成：登记副本并做单组归一化（去重复制）
+                        self._record_replica(
+                            bid, blk, node_id,
+                            event.get("genstamp", blk["genstamp"]),
+                            event.get("checksum", blk["checksum"]),
+                            event.get("size", blk["size"]), "ok")
+                        self._normalize_ec_group(gid)
+                        self.meta.touch("blocks", flush=False)
+                    else:
+                        self._record_replica(
+                            bid, blk, node_id,
+                            event.get("genstamp", blk["genstamp"]),
+                            event.get("checksum", blk["checksum"]),
+                            event.get("size", blk["size"]), "ok")
+                        self.meta.touch("blocks", flush=False)
+            if gid:
+                self._on_ec_shard_done(gid, bid, node_id,
+                                       event.get("indexes", []))
             self.check_block_health(bid)
             self.scheduled.pop(bid, None)
-            self.emit("replicate_done",
-                      f"块 {short_hash(bid, 12)} 成功复制到 {node_id}",
-                      node=node_id, block=bid)
+            if not gid:
+                self.emit("replicate_done",
+                          f"块 {short_hash(bid, 12)} 成功复制到 {node_id}",
+                          node=node_id, block=bid)
         elif etype == "replicate_failed":
             bid = event.get("block_id")
             self.scheduled.pop(bid, None)
-            self.check_block_health(bid)
+            with self.meta.lock:
+                blk = self.meta.get("blocks")["blocks"].get(bid)
+                gid = blk.get("ec_group") if blk else None
+            if gid:
+                self._on_ec_rebuild_failed(
+                    gid, node_id, event.get("indexes", []),
+                    event.get("reason", ""))
+            else:
+                self.check_block_health(bid)
             self.log_event("WARN", "recovery", "replicate_failed",
                            bid or "", "system",
                            f"{node_id}: {event.get('reason', '')}")
         elif etype == "corrupt":
             bid = event.get("block_id")
+            gid = None
             with self.meta.lock:
                 blk = self.meta.get("blocks")["blocks"].get(bid)
                 if blk and node_id in blk.get("replicas", {}):
                     blk["replicas"][node_id]["state"] = "corrupt"
                     blk["replicas"][node_id]["updated_at"] = now()
+                    gid = blk.get("ec_group")
                     self.meta.touch("blocks", flush=False)
             with self.health_lock:
                 self.corrupt_replicas[(bid, node_id)] = {
                     "reason": event.get("reason", ""), "ts": now()}
-            self.check_block_health(bid)
+            if gid:
+                self.check_ec_group(gid)
+            else:
+                self.check_block_health(bid)
             self.log_event("ERROR", "block", "corrupt", f"{bid}@{node_id}",
                            "system", event.get("reason", ""))
             self.emit("corrupt", f"节点 {node_id} 发现块 {short_hash(bid, 12)} 损坏",
@@ -401,6 +457,10 @@ class NameNode:
             pass    # DN 侧连不上 NN 的记录（NN 收到时已恢复，忽略）
         elif etype == "revived":
             self.emit("node_revived", f"节点 {node_id} 重启完成", node=node_id)
+        elif etype == "ec_rebuild_report":
+            gid = event.get("group")
+            self.log_event("INFO", "ec", "rebuild_report", gid or "", "system",
+                           f"{node_id} 重建分片 {event.get('indexes')}")
 
     # ==================================================================
     # 块汇报对账（难点一/二：副本一致性）
@@ -458,7 +518,8 @@ class NameNode:
             if node:
                 node["last_report_at"] = now()
                 node["block_count"] = len(payload.get("blocks", []))
-        # 汇报后重估相关块健康度
+                node.pop("ec_report_due", None)
+        # 汇报后重估相关块健康度（EC 分片块内部转 EC 组评估 + 副本归一化）
         for bid in reported:
             self.check_block_health(bid)
         return {"ok": True, "commands": commands,
@@ -484,6 +545,16 @@ class NameNode:
         with self.node_lock:
             return [n for n in self.nodes.values() if n["state"] == "LIVE"]
 
+    def _node_ready_for_ec(self, node):
+        """
+        节点是否可作为 EC 重建目标：
+        新注册 / 刚复活的节点在完成一次全量块汇报前，NN 块表不完整
+        （它磁盘上可能已持有某些分片），排除之，避免把两个分片重建到
+        同一节点。用显式 ec_report_due 标记判定：注册/复活置位，
+        收到一次全量块汇报后清除。
+        """
+        return not node.get("ec_report_due", False)
+
     def live_good_replicas(self, blk):
         """存活且状态 ok、genstamp 匹配的副本节点列表。"""
         good = []
@@ -507,6 +578,13 @@ class NameNode:
                 self.under_replicated.pop(bid, None)
                 self.missing_blocks.discard(bid)
             return None
+        # EC 分片块：健康度由所属纠删码组统一评估（单分片不做三副本队列）
+        gid = blk.get("ec_group")
+        if gid:
+            self.check_ec_group(gid)
+            return {"block": bid, "state": "ec",
+                    "group": gid,
+                    "live": len(self.live_good_replicas(blk))}
         good = self.live_good_replicas(blk)
         desired = blk.get("desired", config.DEFAULT_REPLICATION)
         state = "healthy"
@@ -540,6 +618,7 @@ class NameNode:
             bids = list(self.meta.get("blocks")["blocks"].keys())
         for bid in bids:
             self.check_block_health(bid)
+        self._rescan_ec_groups()
 
     def _recovery_loop(self):
         """周期扫描恢复队列：为缺副本的块安排 源->目标 复制命令。"""
@@ -552,6 +631,12 @@ class NameNode:
                                str(e))
 
     def _schedule_recovery_once(self):
+        # 先调度纠删码组分片重建，再调度普通三副本再复制
+        try:
+            self._ec_schedule_once()
+        except Exception as e:  # noqa: BLE001
+            self.log_event("ERROR", "ec", "schedule_error", "", "system",
+                           str(e))
         with self.health_lock:
             queue = list(self.under_replicated.items())
         if not queue:
@@ -567,6 +652,11 @@ class NameNode:
             with self.meta.lock:
                 blk = self.meta.get("blocks")["blocks"].get(bid)
             if not blk:
+                with self.health_lock:
+                    self.under_replicated.pop(bid, None)
+                continue
+            if blk.get("ec_group"):
+                # EC 分片块不进三副本队列（由 EC 调度器统一重建）
                 with self.health_lock:
                     self.under_replicated.pop(bid, None)
                 continue
@@ -655,6 +745,9 @@ class NameNode:
                 "block_size": config.BLOCK_SIZE,
                 "replication": config.DEFAULT_REPLICATION,
                 "heartbeat_timeout": config.HEARTBEAT_TIMEOUT,
+                "ec_profiles": {n: {"k": p["k"], "m": p["m"]}
+                                for n, p in config.EC_PROFILES.items()},
+                "default_storage_policy": config.DEFAULT_STORAGE_POLICY,
             }
             self.meta.touch("cluster")
 
@@ -674,6 +767,466 @@ class NameNode:
         if doc not in config.META_DOCS:
             raise NNError(f"未知文档: {doc}")
         return self.meta.export_doc(doc)
+
+    # ==================================================================
+    # 纠删码（Erasure Coding）：组健康 / 自动重建 / 读写
+    # ==================================================================
+    def _ec_doc(self):
+        return self.meta.get("ec_groups")
+
+    @staticmethod
+    def _ec_profile(group):
+        p = config.EC_PROFILES.get(group.get("profile"))
+        if p:
+            return p
+        return {"k": group.get("k"), "m": group.get("m")}
+
+    def _ec_group(self, gid):
+        with self.meta.lock:
+            return self._ec_doc()["groups"].get(gid)
+
+    def _ec_shard_map(self, group, live_only=True):
+        """
+        返回 {index: [(node, rep), ...]}（ok 且 genstamp 匹配的分片副本）。
+        存活好分片的节点集合 = shard_nodes。
+        """
+        live_ids = ({n["node_id"] for n in self.live_nodes()}
+                    if live_only else None)
+        shards = {}
+        with self.meta.lock:
+            blocks = self.meta.get("blocks")["blocks"]
+            for idx_s, bid in group["shards"].items():
+                idx = int(idx_s)
+                blk = blocks.get(bid)
+                if not blk:
+                    shards[idx] = []
+                    continue
+                locs = []
+                for nid, rep in (blk.get("replicas") or {}).items():
+                    if live_ids is not None and nid not in live_ids:
+                        continue
+                    if rep.get("state") != "ok":
+                        continue
+                    if rep.get("genstamp", 0) != blk.get("genstamp", 0):
+                        continue
+                    locs.append((nid, rep))
+                shards[idx] = locs
+        return shards
+
+    def _ec_available(self, group):
+        """
+        评估组健康：
+          返回 dict: index -> {"nodes": [nid...], "bid": bid, "state": ok/corrupt/missing}
+        """
+        k, m = self._ec_profile(group)["k"], self._ec_profile(group)["m"]
+        n = k + m
+        live_ids = {x["node_id"] for x in self.live_nodes()}
+        out = {}
+        with self.meta.lock:
+            blocks = self.meta.get("blocks")["blocks"]
+            for idx in range(n):
+                bid = group["shards"].get(str(idx))
+                blk = blocks.get(bid) if bid else None
+                nodes = []
+                state = "missing"
+                if blk:
+                    corrupt = False
+                    for nid, rep in (blk.get("replicas") or {}).items():
+                        if nid not in live_ids:
+                            continue
+                        if rep.get("genstamp", 0) != blk.get("genstamp", 0):
+                            continue
+                        if rep.get("state") == "ok":
+                            nodes.append(nid)
+                        elif rep.get("state") == "corrupt":
+                            corrupt = True
+                    state = "ok" if nodes else ("corrupt" if corrupt
+                                                else "missing")
+                out[idx] = {"bid": bid, "nodes": nodes, "state": state}
+        return out
+
+    def _normalize_ec_group(self, gid):
+        """
+        保证"不同分片互不共址、每分片只保留一个好副本"。语义见下；
+        返回摘除的重复副本数。调用方需持有 meta.lock。
+        """
+        group = self._ec_doc()["groups"].get(gid)
+        if not group:
+            return 0
+        # 存活节点信息在 meta 锁外取快照（遵守 meta -> node 锁序）
+        live_snap = self.live_nodes()
+        live_ids = {n["node_id"] for n in live_snap}
+        blocks = self.meta.get("blocks")["blocks"]
+        removed = 0
+
+        # 统计每个节点持有的"不同分片"好副本
+        node_shards = {}
+        shard_good = {}
+        for idx_s, bid in group["shards"].items():
+            idx = int(idx_s)
+            blk = blocks.get(bid)
+            good = []
+            if blk:
+                for nid, rep in (blk.get("replicas") or {}).items():
+                    if nid in live_ids and rep.get("state") == "ok" \
+                            and rep.get("genstamp", 0) == blk.get("genstamp", 0):
+                        good.append(nid)
+            shard_good[idx] = (bid, blk, good)
+            for nid in good:
+                node_shards.setdefault(nid, []).append(idx)
+
+        # 1) 同一分片的多份好副本：只保留一个
+        planned = set(group.get("nodes", []))
+        for idx, (bid, blk, good) in shard_good.items():
+            if len(good) <= 1:
+                continue
+            keep = next((n for n in good if n in planned), good[0])
+            for nid in good:
+                if nid == keep:
+                    continue
+                self._enqueue_command(nid, {
+                    "type": "delete", "block_id": bid,
+                    "reason": "EC 分片重复副本归一化（每分片仅保留一处）"})
+                del blk["replicas"][nid]
+                node_shards[nid].remove(idx)
+                removed += 1
+
+        # 2) 不同分片共址：组冗余充足且有空闲就绪节点时，迁出冲突分片
+        for nid, idxs in list(node_shards.items()):
+            if len(set(idxs)) <= 1:
+                continue
+            total = len(group["shards"])
+            good_count = sum(1 for g in shard_good.values() if g[2])
+            occupied = {x for xs in node_shards.values() for x in xs}
+            free_ready = [nd["node_id"] for nd in live_snap
+                          if nd["node_id"] not in occupied
+                          and self._node_ready_for_ec(nd)
+                          and nd.get("storage", {}).get("free", 0)
+                          >= group.get("shard_size", 0)]
+            # 仅在当前布局已能满足容错（好分片数 > k）且确有空闲节点时迁出
+            if not free_ready or good_count <= group["k"]:
+                continue
+            # 迁出该节点上索引最大的分片（保留较小/数据分片优先）
+            move_idx = sorted(set(idxs))[-1]
+            bid, blk, _g = shard_good[move_idx]
+            if blk and nid in blk.get("replicas", {}):
+                self._enqueue_command(nid, {
+                    "type": "delete", "block_id": bid,
+                    "reason": "EC 分片共址自愈：迁移到空闲节点"})
+                del blk["replicas"][nid]
+                node_shards[nid].remove(move_idx)
+                removed += 1
+        return removed
+
+    def ec_group_state_readonly(self, gid):
+        """只读评估组健康（不写元数据、不发事件），供列表/视图使用。"""
+        with self.meta.lock:
+            group = self._ec_doc()["groups"].get(gid)
+            if not group:
+                return None
+            prof = self._ec_profile(group)
+            k, m = prof["k"], prof["m"]
+            avail_map = self._ec_available(group)
+        good = sum(1 for v in avail_map.values() if v["nodes"])
+        return {"group": gid, "k": k, "m": m, "available": good,
+                "missing": [i for i, v in avail_map.items()
+                            if not v["nodes"]],
+                "shards": avail_map,
+                "state": ("healthy" if good >= k + m else
+                          "degraded" if good >= k else "critical")}
+
+    def check_ec_group(self, gid):
+        """评估单个 EC 组，维护 ec_degraded / ec_critical，并触发重建。"""
+        with self.meta.lock:
+            group = self._ec_doc()["groups"].get(gid)
+            if not group:
+                with self.health_lock:
+                    self.ec_degraded.discard(gid)
+                    self.ec_critical.discard(gid)
+                    self.ec_rebuilding.pop(gid, None)
+                return None
+            normalized = self._normalize_ec_group(gid)
+            prof = self._ec_profile(group)
+            k, m = prof["k"], prof["m"]
+            avail_map = self._ec_available(group)
+            good_idx = [i for i, v in avail_map.items() if v["nodes"]]
+            avail = len(good_idx)
+            if normalized:
+                # 仅在确实摘除了重复副本时落盘（查询轮询不产生写放大）
+                self.meta.touch("blocks", flush=False)
+
+        # 清理已恢复分片的历史损坏记录
+        with self.health_lock:
+            if avail >= k + m:
+                self.ec_degraded.discard(gid)
+                self.ec_critical.discard(gid)
+            elif avail >= k:
+                self.ec_critical.discard(gid)
+                if gid not in self.ec_degraded:
+                    self.emit("ec_degraded",
+                              f"纠删码组 {short_hash(gid, 10)} 丢失 "
+                              f"{k + m - avail} 个分片（仍可还原，排队重建）",
+                              group=gid, available=avail, k=k, m=m)
+                self.ec_degraded.add(gid)
+            else:
+                self.ec_degraded.add(gid)
+                if gid not in self.ec_critical:
+                    self.emit("ec_critical",
+                              f"纠删码组 {short_hash(gid, 10)} 仅剩 "
+                              f"{avail}/{k} 个分片，超过容错上限，数据有丢失风险",
+                              group=gid, available=avail, k=k, m=m)
+                self.ec_critical.add(gid)
+        return {"group": gid, "available": avail, "k": k, "m": m,
+                "missing": [i for i, v in avail_map.items()
+                            if not v["nodes"]],
+                "shards": avail_map,
+                "state": ("healthy" if avail >= k + m else
+                          "degraded" if avail >= k else "critical")}
+
+    def _rescan_ec_groups(self):
+        with self.meta.lock:
+            gids = list(self._ec_doc()["groups"].keys())
+        for gid in gids:
+            self.check_ec_group(gid)
+
+    # ---------------- 重建调度 ----------------
+    def _ec_schedule_once(self):
+        with self.health_lock:
+            critical = sorted(self.ec_critical)
+            degraded = sorted(g for g in self.ec_degraded
+                              if g not in self.ec_critical)
+            rebuilding = dict(self.ec_rebuilding)
+        slots = config.EC_MAX_REBUILDING_GROUPS - len(rebuilding)
+        if slots <= 0:
+            return
+        for gid in (critical + degraded):
+            if slots <= 0:
+                break
+            if gid in rebuilding:
+                info = rebuilding[gid]
+                stale = False
+                # 目标节点已死亡/不再就绪 => 立即重排（不必等超时）
+                with self.node_lock:
+                    for tnode in info.get("targets", []):
+                        tn = self.nodes.get(tnode)
+                        if not tn or tn["state"] != "LIVE" or \
+                                tn.get("ec_report_due"):
+                            stale = True
+                if not stale and now() - info.get("at", 0) \
+                        < config.EC_RECOVERY_TIMEOUT:
+                    continue
+                if stale:
+                    with self.health_lock:
+                        self.ec_rebuilding.pop(gid, None)
+                    rebuilding.pop(gid, None)
+                    # 清掉组内已无意义的 recovering 标记，让计划器重选目标
+                    with self.meta.lock:
+                        grp = self._ec_doc()["groups"].get(gid)
+                        if grp and grp.get("rebuild"):
+                            grp["rebuild"]["recovering"] = {}
+                            self.meta.touch("ec_groups", flush=False)
+            try:
+                planned = self._ec_plan_group_rebuild(gid)
+            except Exception as e:  # noqa: BLE001
+                self.log_event("ERROR", "ec", "plan_error", gid, "system",
+                               str(e))
+                continue
+            if planned:
+                slots -= 1
+
+    def _ec_plan_group_rebuild(self, gid):
+        """
+        为一个组安排重建：
+          * 找到缺失分片（无存活好副本）；
+          * 校验分片（发现损坏先删）；
+          * 存活分片 >= k 才可重建；
+          * 每个缺失分片选一个未持有任何组分片的目标节点，下发
+            ec_rebuild 命令（目标节点拉取任意 k 个存活分片，本地解码/重算）。
+        """
+        # 存活节点快照在 meta 锁外获取（遵守 meta -> node 锁序）
+        live_snap = self.live_nodes()
+        live_ids = {x["node_id"] for x in live_snap}
+        with self.meta.lock:
+            group = self._ec_doc()["groups"].get(gid)
+            if not group:
+                return 0
+            prof = self._ec_profile(group)
+            k, m = prof["k"], prof["m"]
+            n = k + m
+            shard_len = group.get("shard_size", 0)
+            blocks = self.meta.get("blocks")["blocks"]
+
+            # 1) 摘除并删除存活节点上的损坏分片，使目标节点可被重新选择
+            good_nodes = {}
+            for idx in range(n):
+                bid = group["shards"].get(str(idx))
+                blk = blocks.get(bid) if bid else None
+                good = []
+                if blk:
+                    for nid in list((blk.get("replicas") or {}).keys()):
+                        if nid not in live_ids:
+                            continue
+                        rep = blk["replicas"][nid]
+                        if rep.get("state") == "ok" and \
+                                rep.get("genstamp", 0) == blk.get("genstamp", 0):
+                            good.append(nid)
+                        else:
+                            self._enqueue_command(nid, {
+                                "type": "delete", "block_id": bid,
+                                "reason": "EC 坏分片删除后重建"})
+                            del blk["replicas"][nid]
+                good_nodes[idx] = good
+
+            missing = [idx for idx in range(n) if not good_nodes.get(idx)]
+            if not missing:
+                self.meta.touch("blocks", flush=False)
+                with self.health_lock:
+                    self.ec_degraded.discard(gid)
+                    self.ec_critical.discard(gid)
+                    self.ec_rebuilding.pop(gid, None)
+                return 0
+            avail_count = n - len(missing)
+            if avail_count < k:
+                self.meta.touch("blocks", flush=False)
+                return 0    # 不足 k 个分片，无法重建（critical 状态等待节点复活）
+
+            occupied = {nid for locs in good_nodes.values() for nid in locs}
+            # 2) 为每个缺失分片选目标节点（互不相同，且不持有组分片）。
+            #    仅选用"已完成复活后首次块汇报"的节点，防止在 NN 块表
+            #    尚未补齐时把两个分片重建到同一节点。
+            candidates = [nd for nd in live_snap
+                          if nd["node_id"] not in occupied
+                          and self._node_ready_for_ec(nd)
+                          and nd.get("storage", {}).get("free", 0)
+                          >= shard_len]
+            targets = self._rank_targets(candidates, shard_len,
+                                         min(len(missing), len(candidates)))
+            assignments = {}
+            for idx, tnode in zip(missing, targets):
+                assignments[idx] = tnode["node_id"]
+            if not assignments:
+                self.meta.touch("blocks", flush=False)
+                return 0
+
+            # 3) 组装命令（每个目标：源为任意 k 个存活分片）
+            source_idx = [i for i in range(n) if good_nodes.get(i)][:k]
+            cmd_targets = []
+            planned_nodes = list(group.get("nodes", []))
+            for idx, tnode_id in assignments.items():
+                bid = group["shards"][str(idx)]
+                blk = blocks.get(bid)
+                sources = []
+                for sidx in source_idx:
+                    src_node = good_nodes[sidx][0]
+                    src_bid = group["shards"][str(sidx)]
+                    src_blk = blocks.get(src_bid)
+                    sources.append({
+                        "index": sidx,
+                        "node": src_node,
+                        "block_id": src_bid,
+                        "url": f"{self._node_url(src_node).rstrip('/')}"
+                               f"/block/{src_bid}",
+                        "checksum": (src_blk or {}).get("checksum"),
+                    })
+                cmd = {
+                    "type": "ec_rebuild",
+                    "group": gid,
+                    "k": k, "m": m,
+                    "profile": group.get("profile"),
+                    "shard_size": shard_len,
+                    "assignments": [{
+                        "index": idx, "block_id": bid,
+                        "genstamp": (blk or {}).get("genstamp",
+                                                    config.GENSTAMP_INITIAL),
+                        "checksum": (blk or {}).get("checksum"),
+                        "size": shard_len,
+                    }],
+                    "sources": sources,
+                }
+                self._enqueue_command(tnode_id, cmd)
+                cmd_targets.append(tnode_id)
+                if tnode_id not in planned_nodes:
+                    planned_nodes.append(tnode_id)
+            group["nodes"] = planned_nodes
+            group["rebuild"] = {
+                "at": now(),
+                "missing_total": len(missing),
+                "recovering": {str(i): {"node": tid, "at": now()}
+                               for i, tid in assignments.items()},
+                "done": [], "failed": 0,
+            }
+            self.meta.touch("ec_groups")
+            self.meta.touch("blocks", flush=False)
+
+        with self.health_lock:
+            self.ec_rebuilding[gid] = {"targets": cmd_targets, "at": now()}
+        self.log_event("WARN", "ec", "rebuild_scheduled", gid, "system",
+                       f"重建分片 {missing} -> 目标 {cmd_targets}")
+        self.emit("ec_rebuild_start",
+                  f"纠删码组 {short_hash(gid, 10)} 开始重建 {len(missing)} "
+                  f"个分片（{k}+{m}）",
+                  group=gid, missing=missing, targets=cmd_targets)
+        return len(assignments)
+
+    def _on_ec_shard_done(self, gid, bid, node_id, indexes):
+        """DN 完成一个（或多个）重建分片后更新组进度。"""
+        done_idx = None
+        with self.meta.lock:
+            group = self._ec_doc()["groups"].get(gid)
+            if group:
+                rb = group.setdefault("rebuild", {})
+                rec = rb.get("recovering", {})
+                # 通过 block_id 反查分片序号（兼容 DN 未回传 indexes 的情况）
+                for idx_s, sbid in group["shards"].items():
+                    if sbid == bid:
+                        done_idx = int(idx_s)
+                if indexes:
+                    done_idx = int(indexes[0])
+                if done_idx is not None and str(done_idx) in rec:
+                    del rec[str(done_idx)]
+                done = rb.setdefault("done", [])
+                if done_idx is not None and done_idx not in done:
+                    done.append(done_idx)
+                total = rb.get("missing_total", 0)
+                rb["progress"] = f"{len(done)}/{total}"
+                self.meta.touch("ec_groups", flush=False)
+        st = self.check_ec_group(gid)
+        if st and st["state"] == "healthy":
+            with self.meta.lock:
+                g = self._ec_doc()["groups"].get(gid)
+                if g:
+                    g["rebuild"] = None
+                    self.meta.touch("ec_groups")
+            with self.health_lock:
+                self.ec_rebuilding.pop(gid, None)
+            self.log_event("INFO", "ec", "rebuild_done", gid, "system",
+                           "组分片全部修复")
+            self.emit("ec_rebuild_done",
+                      f"纠删码组 {short_hash(gid, 10)} 修复完成，冗余已恢复",
+                      group=gid)
+        else:
+            self.emit("ec_rebuild_progress",
+                      f"纠删码组 {short_hash(gid, 10)} 分片 "
+                      f"{short_hash(bid, 10)} 已在 {node_id} 重建",
+                      group=gid, block=bid, node=node_id)
+
+    def _on_ec_rebuild_failed(self, gid, node_id, indexes, reason):
+        with self.meta.lock:
+            group = self._ec_doc()["groups"].get(gid)
+            if group:
+                rb = group.setdefault("rebuild", {})
+                rb["failed"] = rb.get("failed", 0) + 1
+                rb.setdefault("last_error",
+                              f"{node_id}: {(reason or '')[:160]}")
+                self.meta.touch("ec_groups", flush=False)
+        with self.health_lock:
+            self.ec_rebuilding.pop(gid, None)   # 放开重排
+        self.log_event("WARN", "ec", "rebuild_failed", gid, "system",
+                       f"{node_id}: {reason}")
+        self.emit("ec_rebuild_failed",
+                  f"纠删码组 {short_hash(gid, 10)} 在 {node_id} 重建失败，将重试",
+                  group=gid, node=node_id)
+        self.check_ec_group(gid)
 
     # ==================================================================
     # 副本放置 / 块分配（难点一）
@@ -713,8 +1266,13 @@ class NameNode:
             raise NNError("没有满足空间要求的存活节点，无法放置副本")
         return self._rank_targets(live, size, min(count, len(live)))
 
-    def allocate_block(self, size, checksum, desired=None, genstamp=None):
-        """在块表登记新块（副本随后通过流水线复制填充）。"""
+    def allocate_block(self, size, checksum, desired=None, genstamp=None,
+                       ec_info=None):
+        """
+        在块表登记新块（副本随后通过流水线复制填充）。
+        ec_info: {"group": gid, "index": i} 时登记为 EC 分片块
+                 （单副本、由纠删码组管理，不参与三副本队列）。
+        """
         with self.meta.lock:
             blocks_doc = self.meta.get("blocks")
             blocks = blocks_doc["blocks"]
@@ -723,13 +1281,18 @@ class NameNode:
                 bid = gen_id("blk")
             gs = genstamp or blocks_doc.get("next_genstamp", 1000)
             blocks_doc["next_genstamp"] = gs + 1
-            blocks[bid] = {
+            record = {
                 "id": bid, "size": size, "checksum": checksum,
                 "genstamp": gs,
                 "desired": desired or config.DEFAULT_REPLICATION,
                 "created_at": now(),
                 "replicas": {},
             }
+            if ec_info:
+                record["desired"] = 1
+                record["ec_group"] = ec_info["group"]
+                record["ec_index"] = ec_info["index"]
+            blocks[bid] = record
             self.meta.touch("blocks")
             return bid, gs
 
@@ -743,6 +1306,216 @@ class NameNode:
                 if self.live_good_replicas(blk):
                     return bid
             return None
+
+    # ==================================================================
+    # 存储策略（目录冗余方式：三副本 / 纠删码）
+    # ==================================================================
+    def resolve_storage_policy(self, path):
+        """
+        沿目录树向上找最近显式设置 storage_policy 的祖先目录。
+        返回 {"policy": replica|ec, "profile": "ec-2+1"|...,
+              "inherited_from": 路径, "explicit": bool}。
+        """
+        path = os.path.normpath(path).replace("\\", "/")
+        segs = [s for s in path.split("/") if s]
+        with self.meta.lock:
+            inodes = self.fs._inodes()
+            cur = inodes.get(self.fs.root_id)
+            found = None
+            if cur and cur.get("storage_policy"):
+                found = ("/", cur.get("storage_policy"),
+                         cur.get("ec_profile"))
+            cur_path = ""
+            for i, seg in enumerate(segs):
+                cur_path += "/" + seg
+                node = self.fs.resolve(cur_path, must_exist=False)
+                if node and node.get("storage_policy"):
+                    found = (cur_path, node.get("storage_policy"),
+                             node.get("ec_profile"))
+            if found:
+                return {"policy": found[1],
+                        "profile": found[2] or config.EC_DEFAULT_PROFILE,
+                        "inherited_from": found[0], "explicit": True}
+            return {"policy": config.DEFAULT_STORAGE_POLICY,
+                    "profile": config.EC_DEFAULT_PROFILE,
+                    "inherited_from": None, "explicit": False}
+
+    def get_storage_policy_view(self, path):
+        """目录冗余策略视图（含可用方案表与当前集群能否放下）。"""
+        path = path or "/"
+        inode = self.fs.resolve(path)
+        if inode["type"] != "dir":
+            raise FsError(f"不是目录: {path}")
+        eff = self.resolve_storage_policy(path)
+        live_n = len(self.live_nodes())
+        profiles = []
+        for name, p in config.EC_PROFILES.items():
+            need = p["k"] + p["m"]
+            profiles.append({
+                "name": name, "k": p["k"], "m": p["m"],
+                "label": p["label"], "desc": p["desc"],
+                "nodes_required": need,
+                "fits": live_n >= need,
+                "overhead": round((p["k"] + p["m"]) / p["k"], 2),
+            })
+        best = erasure.best_profile(live_n)
+        return {
+            "path": path,
+            "policy": inode.get("storage_policy", eff["policy"]),
+            "is_inherited": not inode.get("storage_policy"),
+            "effective": eff,
+            "ec_profile": inode.get("ec_profile", eff["profile"]),
+            "live_nodes": live_n,
+            "profiles": profiles,
+            "auto_best": best[0] if best else None,
+            "replication": config.DEFAULT_REPLICATION,
+            "replication_overhead": float(config.DEFAULT_REPLICATION),
+        }
+
+    def set_storage_policy(self, path, policy, profile=None, actor="admin"):
+        """
+        设置/清除目录的冗余策略。
+          * 只影响之后新写入/覆盖的文件；旧文件保持原冗余（两种并存、互不干扰）；
+          * 不移动任何已有数据，因此读写不中断。
+        policy 传 "replica" / "ec" / "inherit"（清除显式设置）。
+        """
+        path = path or "/"
+        inode = self.fs.resolve(path)
+        if inode["type"] != "dir":
+            raise FsError(f"不是目录: {path}")
+        policy = (policy or "").strip()
+        if policy not in (config.POLICY_REPLICA, config.POLICY_EC,
+                          "inherit", ""):
+            raise NNError(f"未知冗余策略: {policy}")
+        profile = profile or config.EC_DEFAULT_PROFILE
+        if policy == config.POLICY_EC and profile not in config.EC_PROFILES:
+            raise NNError(f"未知纠删码方案: {profile}")
+        with self.meta.lock:
+            if policy in ("inherit", ""):
+                inode.pop("storage_policy", None)
+                inode.pop("ec_profile", None)
+                action = "reset"
+            else:
+                inode["storage_policy"] = policy
+                if policy == config.POLICY_EC:
+                    inode["ec_profile"] = profile
+                else:
+                    inode.pop("ec_profile", None)
+                action = "set"
+            self.meta.touch("fs")
+        label = {"replica": f"三副本（×{config.DEFAULT_REPLICATION}）",
+                 "ec": f"纠删码 {profile}"}.get(policy, "继承上级")
+        self.log_event("INFO", "fs", "storage_policy", path, actor,
+                       f"目录冗余策略 -> {label}（仅影响新文件，旧数据保留）")
+        self.emit("storage_policy", f"目录 {path} 冗余策略切换为 {label}",
+                  path=path, policy=policy, profile=profile)
+        return {"ok": True, "path": path, "action": action,
+                "view": self.get_storage_policy_view(path)}
+
+    def _pick_ec_profile(self, requested, live_n):
+        """
+        决定写入时使用的 EC 方案：
+          requested 为具体方案时要求节点足够；
+          "auto" / None 时挑集群放得下的最省方案；都放不下抛错。
+        """
+        if requested and requested != "auto":
+            p = config.EC_PROFILES.get(requested)
+            if not p:
+                raise NNError(f"未知纠删码方案: {requested}")
+            if live_n < p["k"] + p["m"]:
+                raise NNError(
+                    f"纠删码方案 {requested} 需要 {p['k'] + p['m']} 个存活节点"
+                    f"（{p['k']} 数据 + {p['m']} 校验），当前只有 {live_n} 个")
+            return requested, p
+        best = erasure.best_profile(live_n)
+        if not best:
+            raise NNError(
+                f"存活节点仅 {live_n} 个，不足以放置纠删码分片（至少 3 个）")
+        return best[0], best[1]
+
+    # ==================================================================
+    # 写路径：纠删码（EC）
+    # ==================================================================
+    def store_ec_data(self, data, profile=None, author="system"):
+        """
+        EC 写入：data -> 切条带组 -> 每组 k+m 分片 -> 每分片一个节点。
+        返回 {data_block_ids, groups:[gid...], content_hash, profile, k, m}。
+        data_block_ids 按顺序为每个组的数据分片块 id（供 inode 引用，
+        顺序拼接即逻辑字节流）。
+        """
+        live_n = len(self.live_nodes())
+        prof_name, prof = self._pick_ec_profile(profile, live_n)
+        k, m = prof["k"], prof["m"]
+        n = k + m
+        content_hash = sha256_bytes(data)
+        total = len(data)
+        max_data = max(k, config.EC_GROUP_MAX_DATA)
+
+        # 切组：每组数据长度按 k 对齐，最后一组可能较短（分片内补零）
+        bounds = list(range(0, total, max_data)) or [0]
+        groups = []
+        data_block_ids = []
+        for gi, start in enumerate(bounds):
+            chunk = data[start:start + max_data]
+            shards, pad = erasure.encode(chunk, k, m)
+            shard_len = len(shards[0])
+            gid = gen_id("ecg")
+            shard_bids = []
+            shard_checksums = [sha256_bytes(s) for s in shards]
+            # 为每个分片选不同节点（每分片一个，共 k+m 个）
+            targets = self.choose_targets(shard_len, n)
+            if len(targets) < n:
+                raise NNError(
+                    f"存活节点不足：{prof_name} 需要 {n} 个，可用 {len(targets)} 个")
+            target_nodes = [t["node_id"] for t in targets]
+            for idx, (shard, csum) in enumerate(zip(shards, shard_checksums)):
+                bid, gs = self.allocate_block(
+                    shard_len, csum, desired=1,
+                    ec_info={"group": gid, "index": idx})
+                shard_bids.append(bid)
+                # EC 分片：单节点直 PUT（不走三副本流水线）
+                t = targets[idx]
+                url = (f"{t['url'].rstrip('/')}/block/{bid}"
+                       f"?genstamp={gs}&checksum={csum}&size={shard_len}")
+                try:
+                    http_request(
+                        url, "PUT", data=shard,
+                        headers={"X-Cluster-Key": self.cluster_key,
+                                 "Content-Type": "application/octet-stream"},
+                        timeout=30)
+                    self._record_stored_replicas(bid, gs, csum, shard_len,
+                                                 [t["node_id"]])
+                except HttpError as e:
+                    self.log_event("ERROR", "ec", "shard_put_failed", bid,
+                                   author, f"{t['node_id']}: {e}")
+                    self.check_ec_group(gid)
+            with self.meta.lock:
+                group = {
+                    "id": gid,
+                    "profile": prof_name, "k": k, "m": m,
+                    "data_len": len(chunk), "shard_size": shard_len,
+                    "pad": pad,
+                    "index": gi, "offset": start,
+                    "shards": {str(i): b for i, b in enumerate(shard_bids)},
+                    "nodes": target_nodes,
+                    "created_at": now(),
+                    "content_hash": sha256_bytes(chunk),
+                    "rebuild": None,
+                }
+                self._ec_doc()["groups"][gid] = group
+                self.meta.touch("ec_groups")
+            groups.append(gid)
+            data_block_ids.extend(shard_bids[:k])
+            self.check_ec_group(gid)
+            self.log_event("INFO", "ec", "group_written", gid, author,
+                           f"{prof_name} 组 #{gi}：{len(chunk)} B 数据，"
+                           f"{n} 分片分布到 {','.join(target_nodes)}")
+        return {"block_ids": data_block_ids,
+                "data_block_ids": data_block_ids, "groups": groups,
+                "content_hash": content_hash,
+                "profile": prof_name, "k": k, "m": m,
+                "dedup_hits": 0,
+                "storage": config.POLICY_EC}
 
     # ==================================================================
     # 写路径：流水线复制
@@ -838,10 +1611,17 @@ class NameNode:
                 "manifest": manifest, "dedup_hits": dedup_hits}
 
     def write_file_internal(self, path, data, author="admin", mime=None,
-                            owner=None):
+                            owner=None, storage=None, ec_profile=None):
         """
         写文件（内部 API）：确保父目录存在 -> 存块 -> 建/覆盖 inode。
         path 为完整文件路径；data 可以是 bytes 或 str（按 UTF-8 编码）。
+
+        storage:
+          None/"auto" -> 按路径所属目录的存储策略决定（三副本 / 纠删码）；
+          "replica"   -> 强制三副本；
+          "ec"        -> 强制纠删码（ec_profile 指定方案，None 用目录/默认）。
+        切换目录策略后，旧文件仍保留原有块布局，新文件按新策略写——
+        两种冗余方式在同一目录下并存、互不干扰。
         """
         if isinstance(data, str):
             data = data.encode("utf-8")
@@ -853,29 +1633,142 @@ class NameNode:
         mime = mime or guess_mime(name)
         with self.meta.lock:
             self.fs.mkdirs(dir_path, owner or author)
-            result = self.store_data_blocks(data, author=author)
+            if storage in (None, "auto"):
+                policy = self.resolve_storage_policy(dir_path)
+                storage = policy["policy"]
+                if not ec_profile:
+                    ec_profile = policy["profile"]
+            if storage == config.POLICY_EC:
+                result = self.store_ec_data(data, ec_profile, author=author)
+            else:
+                result = self.store_data_blocks(data, author=author)
             inode = self.fs.create_file(dir_path, name, len(data),
                                         result["content_hash"],
                                         result["block_ids"], mime,
-                                        owner or author)
+                                        owner or author,
+                                        storage=result.get(
+                                            "storage", config.POLICY_REPLICA),
+                                        ec_groups=result.get("groups"),
+                                        ec_profile=result.get("profile"))
         self._record_hourly("uploads", 1)
         self._record_hourly("bytes_in", len(data))
         return {"path": path, "inode_id": inode["id"],
                 "size": len(data), "mime": mime,
+                "storage": inode.get("storage", config.POLICY_REPLICA),
+                "ec_profile": inode.get("ec_profile"),
+                "ec_groups": inode.get("ec_groups", []),
                 "content_hash": result["content_hash"],
                 "block_ids": result["block_ids"],
                 "chunks": len(result["block_ids"]),
-                "dedup_hits": result["dedup_hits"]}
+                "dedup_hits": result.get("dedup_hits", 0)}
 
     # ==================================================================
-    # 读路径（副本轮询 + 故障转移）
+    # 读路径（副本轮询 + 故障转移；纠删码组重建读取）
     # ==================================================================
+    def _fetch_shard(self, bid, node_id, blk):
+        """从指定节点拉取一个分片/块字节并校验（失败抛异常）。"""
+        url = f"{self._node_url(node_id).rstrip('/')}/block/{bid}"
+        _s, _h, data = http_request(
+            url, "GET", headers={"X-Cluster-Key": self.cluster_key},
+            timeout=20)
+        if sha256_bytes(data) != blk["checksum"]:
+            raise NNError(f"{node_id} 分片校验和不匹配")
+        return data
+
+    def read_ec_group(self, gid, want_indices=None, verify=True):
+        """
+        读一个纠删码组：从存活好分片所在节点拉取（任意 k 个即可），
+        本地 Reed-Solomon 重建需要的数据分片。
+          want_indices None -> 返回全部数据分片（bytes 列表，按 0..k-1）；
+          指定集合 -> 返回 {index: bytes}。
+        拉到坏分片自动剔除并尝试下一个；存活好分片不足 k 个抛 MissingBlockError。
+        """
+        with self.meta.lock:
+            group = self._ec_doc()["groups"].get(gid)
+            if not group:
+                raise MissingBlockError(f"纠删码组不存在: {gid}")
+            prof = self._ec_profile(group)
+            k, m = prof["k"], prof["m"]
+            shard_meta = {}
+            for idx_s, bid in group["shards"].items():
+                blk = self.meta.get("blocks")["blocks"].get(bid)
+                shard_meta[int(idx_s)] = (bid, blk)
+        avail = self._ec_available(group)
+        good = [i for i, v in avail.items() if v["nodes"]]
+        if len(good) < k:
+            raise MissingBlockError(
+                f"纠删码组 {short_hash(gid, 10)} 仅 {len(good)}/{k} 个"
+                f"存活分片，暂时无法读取（等待自动重建）")
+        # 优先数据分片，再补校验分片，凑够 k 个
+        preferred = sorted(good, key=lambda i: (i >= k, i))
+        chosen = preferred[:k]
+        available = {}
+        used_nodes = []
+        errors = []
+        for idx in chosen:
+            bid, blk = shard_meta.get(idx, (None, None))
+            if not blk:
+                errors.append(f"#{idx}:块表缺失")
+                continue
+            nodes = list(avail[idx]["nodes"])
+            random.shuffle(nodes)
+            for nid in nodes:
+                try:
+                    data = self._fetch_shard(bid, nid, blk)
+                    available[idx] = data
+                    used_nodes.append(nid)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"#{idx}@{nid}:{e}")
+                    with self.meta.lock:
+                        b2 = self.meta.get("blocks")["blocks"].get(bid)
+                        if b2 and nid in b2.get("replicas", {}):
+                            b2["replicas"][nid]["state"] = "corrupt"
+                            self.meta.touch("blocks", flush=False)
+                    self.check_ec_group(gid)
+        if len(available) < k:
+            raise MissingBlockError(
+                f"纠删码组 {short_hash(gid, 10)} 读取失败（仅获取 "
+                f"{len(available)}/{k} 分片）: {errors[:4]}")
+        if want_indices is None:
+            rebuilt = erasure.reconstruct(available, k, m,
+                                          want=set(range(k)))
+            return [rebuilt[i] for i in range(k)], used_nodes
+        want = set(want_indices)
+        return erasure.reconstruct(available, k, m, want=want), used_nodes
+
     def read_blocks(self, block_ids, verify=True):
-        """按块表顺序拼接读取（版本合并/预览/diff 使用）。"""
+        """按块表顺序拼接读取（版本合并/预览/diff 使用，自动识别 EC 分片序列）。"""
+        if not block_ids:
+            return b""
+        with self.meta.lock:
+            blocks_doc = self.meta.get("blocks")
+            gids = []
+            for bid in block_ids:
+                blk = blocks_doc["blocks"].get(bid)
+                gid = blk.get("ec_group") if blk else None
+                if gid and gid not in gids:
+                    gids.append(gid)
+        if not gids:
+            out = []
+            for bid in block_ids:
+                data, _meta, _node = self.read_block(bid, verify=verify)
+                out.append(data)
+            return b"".join(out)
+        # EC 文件：按组解码（block_ids 为各组数据分片，顺序与组列表一致）
+        with self.meta.lock:
+            ordered = []
+            for bid in block_ids:
+                blk = self.meta.get("blocks")["blocks"].get(bid)
+                gid = blk.get("ec_group") if blk else None
+                if gid and gid not in ordered:
+                    ordered.append(gid)
         out = []
-        for bid in block_ids:
-            data, _meta, _node = self.read_block(bid, verify=verify)
-            out.append(data)
+        for gid in ordered:
+            shards, _nodes = self.read_ec_group(gid)
+            with self.meta.lock:
+                grp = self._ec_doc()["groups"][gid]
+                out.append(b"".join(shards)[:grp["data_len"]])
         return b"".join(out)
 
     def read_block(self, bid, start=None, end=None, verify=True,
@@ -942,6 +1835,7 @@ class NameNode:
     def read_file_range(self, path, offset=0, length=None, user=None):
         """
         文件级 Range 读：把 [offset, offset+length) 映射到块区间逐块读取。
+        三副本文件走块副本轮询；纠删码文件走组重建（按组定位偏移）。
         返回 (data, info)。
         """
         with self.meta.lock:
@@ -950,11 +1844,26 @@ class NameNode:
                 raise FsError(f"不是文件: {path}")
             block_ids = list(inode.get("block_ids", []))
             size = inode.get("size", 0)
+            is_ec = inode.get("storage") == config.POLICY_EC
+            ec_group_ids = list(inode.get("ec_groups", []))
         offset = max(0, min(offset, size))
         end = size - 1 if length is None else min(size - 1, offset + length - 1)
         if size == 0 or offset > end:
             return b"", {"size": size, "start": offset, "end": offset,
-                         "nodes": [], "blocks_touched": 0}
+                         "nodes": [], "blocks_touched": 0, "storage":
+                         inode.get("storage", "replica")}
+
+        if is_ec and ec_group_ids:
+            data, nodes, touched = self._read_ec_file_range(
+                ec_group_ids, size, offset, end)
+            self.record_access(path, "download", user, len(data),
+                               nodes[0] if nodes else None)
+            return data, {"size": size, "start": offset, "end": end,
+                          "nodes": sorted(set(nodes)),
+                          "blocks_touched": touched,
+                          "storage": "ec",
+                          "ec_profile": inode.get("ec_profile")}
+
         out = []
         nodes = []
         touched = 0
@@ -985,13 +1894,51 @@ class NameNode:
         self.record_access(path, "download", user, len(data),
                            nodes[0] if nodes else None)
         return data, {"size": size, "start": pos, "end": end,
-                      "nodes": sorted(set(nodes)), "blocks_touched": touched}
+                      "nodes": sorted(set(nodes)), "blocks_touched": touched,
+                      "storage": "replica"}
+
+    def _read_ec_file_range(self, group_ids, size, start, end):
+        """EC 文件的范围读：定位覆盖 [start,end] 的组，逐组解码后切片。"""
+        out = []
+        nodes = []
+        touched = 0
+        with self.meta.lock:
+            plan = []
+            acc = 0
+            for gid in group_ids:
+                grp = self._ec_doc()["groups"].get(gid)
+                if not grp:
+                    raise MissingBlockError(f"纠删码组缺失: {gid}")
+                dlen = grp["data_len"]
+                plan.append((gid, acc, dlen))
+                acc += dlen
+        for gid, goff, dlen in plan:
+            gend = goff + dlen - 1
+            if gend < start or goff > end:
+                continue
+            cache_key = f"ecg:{gid}"
+            decoded = self.block_cache.get(cache_key)
+            if decoded is None:
+                shards, used = self.read_ec_group(gid)
+                with self.meta.lock:
+                    grp = self._ec_doc()["groups"][gid]
+                    decoded = b"".join(shards)[:grp["data_len"]]
+                self.block_cache.put(cache_key, decoded)
+                nodes.extend(used)
+            else:
+                nodes.append("cache")
+            s = max(start, goff) - goff
+            e = min(end, gend) - goff
+            out.append(decoded[s:e + 1])
+            touched += 1
+        return b"".join(out), nodes, touched
 
     # ==================================================================
     # 上传会话（分块上传 + 断点续传）
     # ==================================================================
     def upload_begin(self, path, filename, size, session_id=None,
-                     piece_size=None, user="anonymous"):
+                     piece_size=None, user="anonymous", storage=None,
+                     ec_profile=None):
         with self.session_lock:
             self._prune_sessions_nolock()
             if session_id and session_id in self.sessions:
@@ -1006,6 +1953,10 @@ class NameNode:
             os.makedirs(stage_dir, exist_ok=True)
             piece = piece_size or config.UPLOAD_PIECE_SIZE
             total_pieces = max(1, (size + piece - 1) // piece) if size else 1
+            # 上传时按目标目录策略确定本文件冗余方式（显式参数可覆盖）
+            pol = self.resolve_storage_policy(path)
+            storage = storage or pol["policy"]
+            ec_profile = ec_profile or pol["profile"]
             sess = {
                 "id": sess_id, "path": path, "filename": filename,
                 "size": size, "piece_size": piece,
@@ -1013,11 +1964,17 @@ class NameNode:
                 "received": {},            # idx -> {size, checksum, ts}
                 "user": user, "created_at": now(), "last_active": now(),
                 "stage_dir": stage_dir, "completed": False, "result": None,
+                "storage": storage, "ec_profile": ec_profile,
             }
             self.sessions[sess_id] = sess
         self.log_event("INFO", "upload", "begin", f"{path}/{filename}", user,
-                       f"size={size} piece={piece} pieces={total_pieces}")
-        return self._session_view(sess)
+                       f"size={size} piece={piece} pieces={total_pieces} "
+                       f"storage={storage}"
+                       + (f"/{ec_profile}" if storage == "ec" else ""))
+        view = self._session_view(sess)
+        view["storage"] = storage
+        view["ec_profile"] = ec_profile if storage == "ec" else None
+        return view
 
     def _session_view(self, sess):
         return {
@@ -1091,7 +2048,10 @@ class NameNode:
             raise NNError(f"拼接后大小不符: {len(data)} != {sess['size']}")
         t0 = now()
         full_path = sess["path"].rstrip("/") + "/" + sess["filename"]
-        info = self.write_file_internal(full_path, data, user)
+        info = self.write_file_internal(
+            full_path, data, user,
+            storage=sess.get("storage"),
+            ec_profile=sess.get("ec_profile"))
         elapsed = now() - t0
         result = {
             "ok": True, "file": info, "elapsed_s": round(elapsed, 3),
@@ -1153,10 +2113,23 @@ class NameNode:
             if inode["type"] != "file":
                 raise FsError(f"不是文件: {path}")
             blk_metas = [self._block_meta(b) for b in inode.get("block_ids", [])]
+            is_ec = inode.get("storage") == config.POLICY_EC
+        if is_ec:
+            return {
+                "path": path, "name": inode["name"],
+                "size": inode.get("size", 0),
+                "content_hash": inode.get("content_hash"),
+                "mime": inode.get("mime"),
+                "storage": "ec",
+                "ec_profile": inode.get("ec_profile"),
+                "ec_groups": inode.get("ec_groups", []),
+                "blocks": [],
+            }
         return {
             "path": path, "name": inode["name"], "size": inode.get("size", 0),
             "content_hash": inode.get("content_hash"),
             "mime": inode.get("mime"),
+            "storage": "replica",
             "blocks": [{"id": b["id"], "size": b["size"],
                         "checksum": b["checksum"][:16],
                         "genstamp": b["genstamp"],
@@ -1273,11 +2246,22 @@ class NameNode:
         total_used = sum(n.get("storage", {}).get("used", 0) for n in nodes)
         rep_dist = {}
         size_hist = {}
+        ec_shard_count = 0
+        ec_groups = 0
         for blk in blocks:
+            if blk.get("ec_group"):
+                ec_shard_count += 1
+                continue
             live = len(self.live_good_replicas(blk))
             rep_dist[str(live)] = rep_dist.get(str(live), 0) + 1
             bucket = chunking.size_bucket(blk.get("size", 0))
             size_hist[bucket] = size_hist.get(bucket, 0) + 1
+        with self.meta.lock:
+            ec_groups = len(self._ec_doc()["groups"])
+            ec_profiles = {}
+            for g in self._ec_doc()["groups"].values():
+                p = g.get("profile", "?")
+                ec_profiles[p] = ec_profiles.get(p, 0) + 1
         logical = fs_stats["bytes"]
         return {
             "files": fs_stats["files"],
@@ -1287,6 +2271,10 @@ class NameNode:
             "replication_overhead": round(total_used / logical, 2)
             if logical else 0,
             "blocks": len(blocks),
+            "replica_blocks": len(blocks) - ec_shard_count,
+            "ec_shard_blocks": ec_shard_count,
+            "ec_groups": ec_groups,
+            "ec_profiles": ec_profiles,
             "block_size_hist": size_hist,
             "replica_dist": rep_dist,
             "capacity": total_cap,
@@ -1368,13 +2356,17 @@ class NameNode:
         per_node_blocks = {n["node_id"]: 0 for n in nodes}
         per_node_bytes = {n["node_id"]: 0 for n in nodes}
         per_node_corrupt = {n["node_id"]: 0 for n in nodes}
+        per_node_ec = {n["node_id"]: 0 for n in nodes}
         with self.meta.lock:
             blocks = list(self.meta.get("blocks")["blocks"].values())
         for blk in blocks:
+            is_ec = bool(blk.get("ec_group"))
             for nid, rep in list((blk.get("replicas") or {}).items()):
                 if nid in per_node_blocks:
                     per_node_blocks[nid] += 1
                     per_node_bytes[nid] += rep.get("size", 0)
+                    if is_ec:
+                        per_node_ec[nid] += 1
                     if rep.get("state") == "corrupt":
                         per_node_corrupt[nid] += 1
         out = []
@@ -1395,6 +2387,7 @@ class NameNode:
                 "vv": n.get("vv", {}), "doc_vv": n.get("doc_vv", {}),
                 "nn_block_count": per_node_blocks.get(nid, 0),
                 "nn_block_bytes": per_node_bytes.get(nid, 0),
+                "nn_ec_shards": per_node_ec.get(nid, 0),
                 "corrupt": per_node_corrupt.get(nid, 0),
                 "pending_commands": len(self.pending_commands.get(nid, [])),
             })
@@ -1404,6 +2397,7 @@ class NameNode:
                 "corrupt_replicas": len(self.corrupt_replicas),
                 "missing_blocks": len(self.missing_blocks),
                 "scheduled": len(self.scheduled),
+                "ec_groups": self.ec_stats_counts(),
             }
         return {"nodes": out, "health": health,
                 "summary": {
@@ -1412,6 +2406,62 @@ class NameNode:
                     "suspect": sum(1 for n in out if n["state"] == "SUSPECT"),
                     "dead": sum(1 for n in out if n["state"] == "DEAD"),
                 }}
+
+    def ec_stats_counts(self):
+        """EC 组计数（调用方持 health_lock 或容忍近似）。"""
+        return {"total": len(self._ec_doc()["groups"]),
+                "degraded": len(self.ec_degraded),
+                "critical": len(self.ec_critical),
+                "rebuilding": len(self.ec_rebuilding)}
+
+    def ec_groups_view(self, limit=200):
+        """EC 组列表（节点页/存储策略页展示：方案、落点、健康、修复进度）。"""
+        with self.meta.lock:
+            gids = list(self._ec_doc()["groups"].keys())[:limit]
+        rows = []
+        for gid in gids:
+            st = self.check_ec_group(gid)
+            if not st:
+                continue
+            group = self._ec_group(gid)
+            shard_brief = []
+            with self.meta.lock:
+                blocks = self.meta.get("blocks")["blocks"]
+                for idx, v in st["shards"].items():
+                    shard_brief.append({
+                        "index": idx,
+                        "kind": "data" if idx < st["k"] else "parity",
+                        "nodes": v["nodes"], "state": v["state"],
+                        "checksum": ((blocks.get(v["bid"]) or {})
+                                     .get("checksum") or "")[:10],
+                    })
+            rec = (group.get("rebuild") or {}).get("recovering", {})
+            rows.append({
+                "id": gid,
+                "short": short_hash(gid.replace("ecg_", ""), 10),
+                "profile": group.get("profile"),
+                "k": st["k"], "m": st["m"],
+                "data_len": group.get("data_len"),
+                "shard_size": group.get("shard_size"),
+                "available": st["available"],
+                "status": st["state"],
+                "missing": st["missing"],
+                "shards": shard_brief,
+                "recovering": rec,
+                "nodes": group.get("nodes", []),
+                "created_at": group.get("created_at"),
+                "rebuild": group.get("rebuild"),
+                "paths": self.block_paths(
+                    group["shards"].get("0"), ec_group_only=True),
+            })
+        rows.sort(key=lambda r: ({"critical": 0, "degraded": 1,
+                                  "healthy": 2}[r["status"]],
+                                 -r.get("data_len", 0)))
+        return {"groups": rows, "counts": {
+            "total": len(rows),
+            "degraded": sum(1 for r in rows if r["status"] == "degraded"),
+            "critical": sum(1 for r in rows if r["status"] == "critical"),
+            "rebuilding": sum(1 for r in rows if r.get("rebuild"))}}
 
     def node_blocks(self, node_id, limit=200, offset=0):
         """从 DataNode 实时拉取其块清单（HTTP 同步演示）。"""
@@ -1433,14 +2483,16 @@ class NameNode:
                         "stored_at": rep.get("updated_at")})
         return {"total": total, "blocks": out}
 
-    def replica_matrix(self, limit=60):
-        """块 x 节点 副本分布矩阵（节点页可视化）。"""
+    def replica_matrix(self, limit=60, include_ec=False):
+        """块 x 节点 副本分布矩阵（节点页可视化，默认只列三副本块）。"""
         with self.node_lock:
             node_ids = sorted(self.nodes.keys())
             live_ids = {nid for nid, n in self.nodes.items()
                         if n["state"] == "LIVE"}
         with self.meta.lock:
-            blocks = dict(self.meta.get("blocks")["blocks"])
+            all_blocks = self.meta.get("blocks")["blocks"]
+            blocks = {bid: b for bid, b in all_blocks.items()
+                      if include_ec or not b.get("ec_group")}
 
         def good_count(blk):
             n = 0
@@ -1493,6 +2545,8 @@ class NameNode:
             under_items = []
             for bid, info in list(under.items())[:80]:
                 blk = blocks.get(bid, {})
+                if blk.get("ec_group"):
+                    continue
                 under_items.append({
                     "block": bid, "desired": blk.get("desired"),
                     "live": len(self.live_good_replicas(blk)) if blk else 0,
@@ -1500,11 +2554,21 @@ class NameNode:
                     "scheduled": scheduled.get(bid),
                     "size": blk.get("size", 0),
                 })
+        # EC 组修复进度
+        ec_groups = []
+        for g in self.ec_groups_view(limit=120)["groups"]:
+            if g["status"] != "healthy" or g.get("rebuild"):
+                ec_groups.append(g)
         return {"under_replicated": under_items, "corrupt": corrupt,
                 "missing": sorted(missing)[:80],
-                "counts": {"under": len(under), "corrupt": len(corrupt),
+                "ec_groups": ec_groups,
+                "counts": {"under": len(under_items),
+                           "corrupt": len(corrupt),
                            "missing": len(missing),
-                           "scheduled": len(scheduled)}}
+                           "scheduled": len(scheduled),
+                           "ec_degraded": len(self.ec_degraded),
+                           "ec_critical": len(self.ec_critical),
+                           "ec_rebuilding": len(self.ec_rebuilding)}}
 
     # ---- 演练 ----
     def sim_kill_node(self, node_id):
@@ -1563,6 +2627,11 @@ class NameNode:
         with self.meta.lock:
             for _p, inode in self.fs.all_files():
                 refs.update(inode.get("block_ids", []))
+                # EC 文件的校验分片不在 inode.block_ids 内，由组表补入保护集
+                for gid in inode.get("ec_groups", []):
+                    grp = self._ec_doc()["groups"].get(gid)
+                    if grp:
+                        refs.update(grp["shards"].values())
             trash_root = self.fs.get_inode(self.fs.trash_id)
             if trash_root:
                 stack = list(trash_root.get("children", []))
@@ -1573,25 +2642,99 @@ class NameNode:
                     if not node:
                         continue
                     refs.update(node.get("block_ids", []))
+                    for gid in node.get("ec_groups", []):
+                        grp = self._ec_doc()["groups"].get(gid)
+                        if grp:
+                            refs.update(grp["shards"].values())
                     stack.extend(node.get("children", []))
         refs |= self.versions.all_referenced_blocks()
+        refs |= self.all_ec_blocks_in_version_refs()
         with self.session_lock:
             for sess in self.sessions.values():
                 refs.update(sess.get("result", {}).get("file", {})
                             .get("block_ids", []) if sess.get("result") else [])
         return refs
 
+    def all_ec_blocks_in_version_refs(self):
+        """旧快照可能只记了数据分片块；按块表 ec_group 反查补齐同组全部分片。"""
+        extra = set()
+        with self.meta.lock:
+            blocks = self.meta.get("blocks")["blocks"]
+            groups = self._ec_doc()["groups"]
+            for bid in self.versions.all_referenced_blocks():
+                blk = blocks.get(bid)
+                if blk and blk.get("ec_group"):
+                    grp = groups.get(blk["ec_group"])
+                    if grp:
+                        extra.update(grp["shards"].values())
+        return extra
+
+    def _referenced_ec_groups(self):
+        """仍被活动文件 / 回收站 / 版本快照引用的 EC 组 id 集合。"""
+        gids = set()
+        with self.meta.lock:
+            blocks = self.meta.get("blocks")["blocks"]
+            for _p, inode in self.fs.all_files():
+                gids.update(inode.get("ec_groups", []))
+            trash_root = self.fs.get_inode(self.fs.trash_id)
+            if trash_root:
+                stack = list(trash_root.get("children", []))
+                inodes = self.fs._inodes()
+                while stack:
+                    cur = stack.pop()
+                    node = inodes.get(cur)
+                    if not node:
+                        continue
+                    gids.update(node.get("ec_groups", []))
+                    stack.extend(node.get("children", []))
+            # 版本快照（新快照存 ec_groups；旧快照靠块反查）
+            for c in self.versions._v()["commits"].values():
+                for e in c.get("snapshot", {}).values():
+                    gids.update(e.get("ec_groups", []))
+                    for bid in e.get("block_ids", []):
+                        blk = blocks.get(bid)
+                        if blk and blk.get("ec_group"):
+                            gids.add(blk["ec_group"])
+        return gids
+
     def gc_blocks(self):
         """回收未被引用的块（宽限期防止误删刚写的块）。"""
         refs = self.referenced_blocks()
+        live_groups = self._referenced_ec_groups()
         t = now()
         deleted = 0
+        ec_groups_deleted = 0
         with self.meta.lock:
             blocks_doc = self.meta.get("blocks")
             blocks = blocks_doc["blocks"]
             by_ck = blocks_doc.get("by_checksum", {})
+            ec_doc = self._ec_doc()
+            # 1) 回收无引用的 EC 组（连带其全部分片块）
+            for gid in list(ec_doc["groups"].keys()):
+                grp = ec_doc["groups"][gid]
+                if gid in live_groups:
+                    continue
+                if t - grp.get("created_at", t) < config.GC_GRACE_SECONDS:
+                    continue
+                for bid in grp["shards"].values():
+                    blk = blocks.pop(bid, None)
+                    if blk:
+                        for nid in (blk.get("replicas") or {}):
+                            self._enqueue_command(nid, {
+                                "type": "delete", "block_id": bid,
+                                "reason": "GC：无引用的 EC 分片"})
+                        deleted += 1
+                del ec_doc["groups"][gid]
+                ec_groups_deleted += 1
+                with self.health_lock:
+                    self.ec_degraded.discard(gid)
+                    self.ec_critical.discard(gid)
+                    self.ec_rebuilding.pop(gid, None)
+            # 2) 回收普通无引用块（EC 分片块统一随组回收，这里跳过）
             to_delete = []
             for bid, blk in blocks.items():
+                if blk.get("ec_group"):
+                    continue
                 if bid in refs:
                     continue
                 if t - blk.get("created_at", t) < config.GC_GRACE_SECONDS:
@@ -1610,11 +2753,12 @@ class NameNode:
                 with self.health_lock:
                     self.under_replicated.pop(bid, None)
                     self.missing_blocks.discard(bid)
-            if deleted:
+            if deleted or ec_groups_deleted:
                 self.meta.touch("blocks")
+                self.meta.touch("ec_groups")
         if deleted:
             self.log_event("INFO", "gc", "gc_blocks", "", "system",
-                           f"回收 {deleted} 个未引用块")
+                           f"回收 {deleted} 个未引用块（含 {ec_groups_deleted} 个 EC 组）")
         return deleted
 
     def _gc_loop(self):
@@ -1646,6 +2790,9 @@ class NameNode:
             inode = self.fs.resolve(path)
             if inode["type"] != "file":
                 raise FsError(f"不是文件: {path}")
+            is_ec = inode.get("storage") == config.POLICY_EC
+            if is_ec:
+                return self._ec_file_detail(inode, path)
             out = []
             for bid in inode.get("block_ids", []):
                 blk = self._block_meta(bid)
@@ -1661,6 +2808,7 @@ class NameNode:
                     "genstamp": blk["genstamp"],
                     "desired": blk.get("desired"),
                     "live": len(live),
+                    "storage": "replica",
                     "status": ("missing" if not live else
                                "under" if len(live) < blk.get("desired", 3)
                                else "ok"),
@@ -1675,11 +2823,105 @@ class NameNode:
                 })
             return {"path": path, "size": inode.get("size", 0),
                     "content_hash": inode.get("content_hash"),
+                    "storage": "replica",
                     "blocks": out}
 
-    def block_paths(self, bid):
-        """反查引用某块的文件路径（节点页/健康队列展示用）。"""
+    def _ec_file_detail(self, inode, path):
+        """EC 文件详情：逐组列出 k+m 个分片的落点节点 / 健康 / 重建进度。"""
+        groups_out = []
+        live_all = {n["node_id"] for n in self.live_nodes()}
+        worst = "healthy"
         with self.meta.lock:
+            blocks_doc = self.meta.get("blocks")
+            ec_doc = self._ec_doc()
+            for gi, gid in enumerate(inode.get("ec_groups", [])):
+                grp = ec_doc["groups"].get(gid)
+                if not grp:
+                    groups_out.append({"id": gid, "missing": True, "index": gi})
+                    worst = "critical"
+                    continue
+                k, m = grp["k"], grp["m"]
+                avail = 0
+                shards = []
+                recovering = (grp.get("rebuild") or {}).get("recovering", {})
+                for idx in range(k + m):
+                    bid = grp["shards"].get(str(idx))
+                    blk = blocks_doc["blocks"].get(bid) if bid else None
+                    reps = []
+                    ok_nodes = []
+                    rep_items = (blk.get("replicas") or {}).items() if blk else []
+                    for nid, r in sorted(rep_items):
+                        live = nid in live_all
+                        good = live and r.get("state") == "ok" and \
+                            r.get("genstamp", 0) == blk.get("genstamp", 0)
+                        if good:
+                            ok_nodes.append(nid)
+                        reps.append({
+                            "node": nid, "state": r.get("state"),
+                            "rack": (self.nodes.get(nid) or {}).get("rack"),
+                            "live": live})
+                    if ok_nodes:
+                        avail += 1
+                    kind = "data" if idx < k else "parity"
+                    shards.append({
+                        "index": idx, "kind": kind,
+                        "id": bid,
+                        "short": short_hash((bid or "").replace("blk_", ""), 8),
+                        "size": (blk or {}).get("size", grp.get("shard_size")),
+                        "checksum": ((blk or {}).get("checksum") or "")[:12],
+                        "nodes": ok_nodes,
+                        "replicas": reps,
+                        "recovering_to": (recovering.get(str(idx)) or {})
+                        .get("node"),
+                        "state": "ok" if ok_nodes else
+                        ("recovering" if str(idx) in recovering else "missing"),
+                    })
+                status = ("healthy" if avail >= k + m else
+                          "degraded" if avail >= k else "critical")
+                if status == "critical":
+                    worst = "critical"
+                elif status == "degraded" and worst != "critical":
+                    worst = "degraded"
+                groups_out.append({
+                    "id": gid,
+                    "short": short_hash(gid.replace("ecg_", ""), 10),
+                    "index": gi,
+                    "profile": grp.get("profile"),
+                    "k": k, "m": m,
+                    "data_len": grp.get("data_len"),
+                    "shard_size": grp.get("shard_size"),
+                    "pad": grp.get("pad", 0),
+                    "available": avail,
+                    "status": status,
+                    "shards": shards,
+                    "rebuild": grp.get("rebuild"),
+                })
+        return {"path": path, "size": inode.get("size", 0),
+                "content_hash": inode.get("content_hash"),
+                "storage": "ec",
+                "ec_profile": inode.get("ec_profile"),
+                "status": worst,
+                "groups": groups_out,
+                "blocks": []}
+
+    def block_paths(self, bid, ec_group_only=False):
+        """反查引用某块（或 EC 组的任一分片）的文件路径（节点页/健康队列展示用）。"""
+        with self.meta.lock:
+            if ec_group_only:
+                group = self._ec_doc()["groups"].get(bid)
+                bids = set(group["shards"].values()) if group else {bid}
+            else:
+                bids = {bid}
             paths = [p for p, inode in self.fs.all_files()
-                     if bid in inode.get("block_ids", [])]
+                     if bids & set(inode.get("block_ids", []))
+                     or bids & self._inode_ec_shard_set(inode)]
         return paths
+
+    def _inode_ec_shard_set(self, inode):
+        out = set()
+        groups = self._ec_doc()["groups"]
+        for gid in inode.get("ec_groups", []):
+            grp = groups.get(gid)
+            if grp:
+                out.update(grp["shards"].values())
+        return out

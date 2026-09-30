@@ -74,7 +74,7 @@ class VersionStore:
         """当前活动文件系统 -> 快照 {path: entry}。"""
         snap = {}
         for path, inode in self.nn.fs.all_files():
-            snap[path] = {
+            entry = {
                 "type": "file",
                 "size": inode.get("size", 0),
                 "content_hash": inode.get("content_hash"),
@@ -83,7 +83,12 @@ class VersionStore:
                 "owner": inode.get("owner", "admin"),
                 "mode": inode.get("mode", "rw-r--r--"),
                 "inode": inode["id"],
+                "storage": inode.get("storage", "replica"),
             }
+            if inode.get("storage") == "ec":
+                entry["ec_groups"] = list(inode.get("ec_groups", []))
+                entry["ec_profile"] = inode.get("ec_profile")
+            snap[path] = entry
         return snap
 
     @staticmethod
@@ -555,8 +560,12 @@ class VersionStore:
                 if action == "reuse":
                     merged_snap[p] = entry
                 elif action == "write":
+                    # 合并重写：按当前目录策略决定冗余方式（旧文件保持各自冗余）
+                    dir_p = "/".join(p.split("/")[:-1]) or "/"
+                    pol = self.nn.resolve_storage_policy(dir_p)
                     info = self.nn.write_file_internal(
-                        p, data, author, mime=entry.get("mime"))
+                        p, data, author, mime=entry.get("mime"),
+                        storage=pol["policy"], ec_profile=pol["profile"])
                     merged_snap[p] = {
                         "type": "file", "size": info["size"],
                         "content_hash": info["content_hash"],
@@ -565,6 +574,9 @@ class VersionStore:
                         "owner": entry.get("owner", author),
                         "mode": entry.get("mode", "rw-r--r--"),
                         "inode": info["inode_id"],
+                        "storage": info["storage"],
+                        "ec_groups": info.get("ec_groups", []),
+                        "ec_profile": info.get("ec_profile"),
                     }
             stats = self._snapshot_change_stats(ours_snap, merged_snap)
             cid = self._commit_id([ours["id"], theirs["id"]],
@@ -742,7 +754,10 @@ class VersionStore:
                                entry.get("content_hash"),
                                entry.get("block_ids", []),
                                entry.get("mime", ""),
-                               entry.get("owner", author))
+                               entry.get("owner", author),
+                               storage=entry.get("storage", "replica"),
+                               ec_groups=entry.get("ec_groups"),
+                               ec_profile=entry.get("ec_profile"))
             # 3. 清理空目录（不属于任何快照路径前缀）
             prefixes = set()
             for p in snapshot:
@@ -790,7 +805,10 @@ class VersionStore:
             inode = fs.create_file(dir_path, name, entry.get("size", 0),
                                    entry.get("content_hash"),
                                    entry.get("block_ids", []),
-                                   entry.get("mime", ""), author)
+                                   entry.get("mime", ""), author,
+                                   storage=entry.get("storage", "replica"),
+                                   ec_groups=entry.get("ec_groups"),
+                                   ec_profile=entry.get("ec_profile"))
             self.nn.log_event("INFO", "version", "restore_file", path, author,
                               f"从 {short_hash(c['id'], 8)} 恢复文件")
             return {"path": path, "inode": inode["id"],

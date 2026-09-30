@@ -47,6 +47,13 @@
               <label class="fl" style="flex:1">目标目录
                 <input type="text" id="up-path" value="/">
               </label>
+              <label class="fl">冗余方式
+                <select id="up-storage">
+                  <option value="auto" selected>跟随目录策略</option>
+                  <option value="replica">⧉ 三副本 ×3</option>
+                  <option value="ec">🧩 纠删码 ×1.5</option>
+                </select>
+              </label>
               <label class="fl">分片大小
                 <select id="up-piece">
                   <option value="32768">32 KiB</option>
@@ -56,6 +63,7 @@
                 </select>
               </label>
             </div>
+            <div class="small muted" id="up-policy-hint" style="margin:-4px 0 10px"></div>
 
             <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
               <div class="pbar" style="flex:1"><i id="up-bar" style="width:0%"></i></div>
@@ -162,6 +170,26 @@ dropzone.ondrop = (e) => {
   if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
 };
 fileInput.onchange = () => { if (fileInput.files.length) setFile(fileInput.files[0]); };
+document.getElementById("up-path").addEventListener("blur", refreshPolicyHint);
+document.getElementById("up-storage").addEventListener("change", refreshPolicyHint);
+
+async function refreshPolicyHint() {
+  const hint = document.getElementById("up-policy-hint");
+  const sel = document.getElementById("up-storage").value;
+  const path = document.getElementById("up-path").value.trim() || "/";
+  try {
+    const v = await api("GET", "/api/fs/storage_policy?path=" + encodeURIComponent(path));
+    const eff = v.effective.policy === "ec"
+      ? `🧩 纠删码 ${v.effective.profile}（×1.5，目录 ${v.effective.inherited_from || "/"} 设定）`
+      : "⧉ 三副本 ×3（系统默认）";
+    const auto = v.profiles.find(p => p.name === v.ec_profile);
+    const fit = auto ? auto.fits : true;
+    hint.innerHTML = sel === "auto"
+      ? `该目录生效冗余：<b>${eff}</b>${fit ? "" : ' <span class="badge bad plain">当前节点不足</span>'}`
+      : (sel === "ec" ? `本文件将强制使用 <b>纠删码（按节点自动选方案）</b>`
+                      : `本文件将强制使用 <b>三副本</b>`);
+  } catch (e) { hint.textContent = ""; }
+}
 
 function setFile(f) {
   upFile = f;
@@ -173,6 +201,7 @@ function setFile(f) {
   document.getElementById("up-result").style.display = "none";
   renderPieces(0, 0);
   setUpStatus("就绪");
+  refreshPolicyHint();
   checkResume(f);
 }
 
@@ -247,9 +276,12 @@ async function startUpload(existingSession) {
   document.getElementById("up-pause").textContent = "暂停";
 
   try {
+    const storage = document.getElementById("up-storage").value;
     const begin = await api("POST", "/api/upload/begin", {
       path, filename: upFile.name, size: upFile.size,
       piece_size: piece, session: existingSession || undefined,
+      storage: storage === "auto" ? undefined : storage,
+      ec_profile: storage === "ec" ? "auto" : undefined,
     });
     upState = {
       session: begin.session, total: begin.total_pieces, piece: begin.piece_size,
@@ -357,11 +389,16 @@ document.getElementById("dl-query").onclick = async () => {
   if (!path) return toast("请输入文件路径", "warn");
   try {
     dlInfo = await api("GET", "/api/download/info?path=" + encodeURIComponent(path));
+    const storageHtml = dlInfo.storage === "ec"
+      ? `<span class="badge violet plain">🧩 纠删码 ${esc(dlInfo.ec_profile || "")} · ${dlInfo.ec_groups.length} 条带组</span>`
+      : `<span class="badge acc plain">⧉ 三副本 · ${dlInfo.blocks.length} 块</span>`;
     document.getElementById("dl-info").innerHTML = `
-      <b>${esc(dlInfo.name)}</b> · ${fmtBytes(dlInfo.size)} · ${esc(dlInfo.mime)} ·
-      ${dlInfo.blocks.length} 块 · sha256 <span class="mono">${esc(dlInfo.content_hash.slice(0, 20))}…</span>
-      <div class="small" style="margin-top:4px">副本分布：${dlInfo.blocks.map(b =>
-        `<span class="chip" title="${esc(b.id)}">${esc(b.checksum.slice(0, 6))}→[${esc(b.replicas.join(","))}]</span>`).join(" ")}</div>`;
+      <b>${esc(dlInfo.name)}</b> · ${fmtBytes(dlInfo.size)} · ${esc(dlInfo.mime)} · ${storageHtml}
+      · sha256 <span class="mono">${esc(dlInfo.content_hash.slice(0, 20))}…</span>
+      ${dlInfo.storage === "ec"
+        ? `<div class="small" style="margin-top:4px">读时由任意 k 个分片实时还原，单节点故障不影响下载。</div>`
+        : `<div class="small" style="margin-top:4px">副本分布：${dlInfo.blocks.map(b =>
+          `<span class="chip" title="${esc(b.id)}">${esc(b.checksum.slice(0, 6))}→[${esc(b.replicas.join(","))}]</span>`).join(" ")}</div>`}`;
     document.getElementById("dl-start").disabled = dlInfo.size === 0;
     document.getElementById("dl-result").style.display = "none";
   } catch (e) {

@@ -73,7 +73,7 @@ python3 -m backend.datanode --id dn5 --port 8025
                                     │ HTTP（Bearer 令牌 + 路径 ACL）
 ┌───────────────────────────────────▼──────────────────────────────────────┐
 │  NameNode :8020 （backend/namenode.py + http_server.py）                  │
-│   · 元数据 9 个 JSON 文档：fs/blocks/versions/users/perms/                │
+│   · 元数据 10 个 JSON 文档：fs/blocks/ec_groups/versions/users/perms/      │
 │     logs/recycle/stats/cluster   —— 原子写 + 版本向量                     │
 │   · 块表（genstamp/校验和/副本位置）、放置策略、恢复调度、GC                │
 │   · 上传会话（断点续传暂存）、Range 读路径（副本轮询+故障转移）              │
@@ -93,9 +93,9 @@ python3 -m backend.datanode --id dn5 --port 8025
 元数据目录布局（`data/`，全部 JSON，崩溃安全）：
 
 ```
-data/meta/{fs,blocks,versions,users,perms,logs,recycle,stats,cluster}.json
+data/meta/{fs,blocks,ec_groups,versions,users,perms,logs,recycle,stats,cluster}.json
 data/sessions/<upload_id>/piece_000000      # 上传分片暂存
-data/datanodes/<node_id>/blocks/<blk>.dat   # 块本体
+data/datanodes/<node_id>/blocks/<blk>.dat   # 块本体（三副本块与 EC 分片块统一存放）
 data/datanodes/<node_id>/node_state.json    # DN 索引（原子写）
 data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
 ```
@@ -109,6 +109,17 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
   （Buzhash 滚动哈希，O(1) 滑窗，min/avg/max 约束）。
   冒烟测试验证：头部插入 16B 后 CDC 11/12 块不变（去重友好），
   固定分块则几乎全部错位。
+* **两种冗余方式，按目录切换、同目录并存**（`erasure.py`）：
+  - 三副本（默认，×3）：流水线复制 NN → DN1 → DN2 → DN3；
+  - **纠删码 EC（×1.5，更省空间）**：文件切成 k 个数据分片，
+    Reed-Solomon over GF(2⁸)（Cauchy 编码矩阵）线性编码出 m 个
+    校验分片，k+m 个分片分散到不同节点；**任意 k 个分片即可无损
+    还原**，坏任意 m 个分片都能自动重建。方案 ec-2+1 / ec-4+2 / ec-6+3。
+  - 目录存储策略只影响**之后新写入/覆盖**的文件，旧文件保留原块布局
+    ——切换不搬数据、读写不中断，两种冗余在同目录下互不干扰。
+  - EC 分片块以 `ec_group`/`ec_index` 标记并由纠删码组统一管理
+    （每分片单副本、互不共址）；版本快照/历史版本读、回收站、GC、
+    上传下载（含 Range）全部兼容两种冗余。
 * **内容去重**：块表维护 `by_checksum` 索引，相同内容块直接复用。
 * **流水线复制**：NN PUT → DN1 → DN2 → DN3（`X-Forward-To` 链式头），
   每一跳 sha256 校验；应答嵌套展平后登记副本（含每一跳的 ack）。
@@ -123,8 +134,17 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
 * **坏副本主动替换**：corrupt / stale 副本先下发删除并摘除记录，
   使该节点重新成为复制候选，保证队列可收敛（不会卡死）。
 * 节点复活后强制全量块汇报对账；孤儿块（磁盘有、索引无）清理。
+  EC 节点复活后必须完成一次全量块汇报才会被选为分片重建目标
+  （`ec_report_due`），防止在块表未补齐时把两个分片重建到同一节点。
+* **纠删码自动修复**：EC 组每 2s 评估，可用分片 < k+m 即进入
+  degraded（≥k，可读可修）/ critical（<k，超容错上限）；调度器为每个
+  缺失分片选互不相同的空闲就绪节点下发 `ec_rebuild`——目标节点从存活
+  分片里拉取任意 k 个，本地 Reed-Solomon 解码/重算后落盘。
+  自动检测并自愈「分片共址」「重复副本」；修复进度（done/total、
+  目标节点）实时写入组表，页面 2.5s 轮询可见。
 * **静默损坏**：DN scrub 线程抽样重算校验和；读路径 NN 侧二次校验 +
-  副本故障转移；注入演练见 `POST /api/sim/corrupt`。
+  副本故障转移（EC 读路径则剔除坏分片、换用其余分片重建）；
+  注入演练见 `POST /api/sim/corrupt`。
 
 ### 4.3 版本树冲突合并
 * 提交 = 全量快照 + 块引用（块不可变 ⇒ 历史版本天然可读；
@@ -166,6 +186,8 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
 ```
 POST /api/auth/login|logout      GET /api/auth/me|sessions
 GET  /api/fs/tree|list|stat      POST /api/fs/mkdir|rename|move|delete
+GET|POST /api/fs/storage_policy  （按目录切换三副本/纠删码）
+GET  /api/ec/groups|ec/group     （纠删码组：分片落点与自动修复进度）
 GET  /api/thumbnail|file/preview|file/blocks
 POST /api/upload/begin|chunk|complete      GET /api/upload/status|sessions
 GET  /api/download/info|download(Range)
@@ -194,6 +216,7 @@ gsb4/
 │   ├── config.py              # 全部可调参数（块大小/副本/心跳/保留期…）
 │   ├── util.py                # 原子写/版本向量/HTTP 客户端/LRU/环形缓冲
 │   ├── chunking.py            # 固定 + CDC 分块、清单、重组校验
+│   ├── erasure.py             # Reed-Solomon GF(2^8)：EC 编码/任意 k 分片重建
 │   ├── diff_engine.py         # Myers / Patience / merge3 / 渲染器
 │   ├── metadata.py            # JSON 文档仓库（原子写 + vv 同步语义）
 │   ├── auth.py                # 用户/口令/会话 + 路径 ACL

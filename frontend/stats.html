@@ -35,7 +35,10 @@
 
         <!-- 副本分布 -->
         <div class="card">
-          <div class="card-title">副本数分布 <span class="hint">每个块当前存活副本个数</span></div>
+          <div class="card-title">冗余方式分布 <span class="hint">三副本块 vs 纠删码分片</span></div>
+          <div id="storage-donut"></div>
+          <hr class="hr">
+          <div class="card-title" style="font-size:13px">副本数分布 <span class="hint">三副本块存活副本个数</span></div>
           <div id="rep-dist"></div>
           <hr class="hr">
           <div class="card-title" style="font-size:13px">块大小分布</div>
@@ -102,6 +105,7 @@ async function loadAll() {
   ]);
   renderKpis(ov);
   renderCapacity(ov);
+  renderStorageDist(ov);
   renderReplicaDist(ov);
   renderThroughput(tl);
   renderCapHist(tl);
@@ -113,17 +117,35 @@ async function loadAll() {
 function renderKpis(ov) {
   const cells = [
     { label: "逻辑数据量", value: fmtBytes(ov.logical_bytes), sub: `${ov.files} 个文件 / ${ov.dirs} 个目录`, cls: "accent" },
-    { label: "物理占用", value: fmtBytes(ov.physical_bytes), sub: `副本放大 ×${ov.replication_overhead}`, cls: "" },
-    { label: "数据块", value: ov.blocks, sub: `块大小 ${fmtBytes(64 * 1024)}（定长）`, cls: "" },
+    { label: "物理占用", value: fmtBytes(ov.physical_bytes), sub: `综合开销放大 ×${ov.replication_overhead}`, cls: "" },
+    { label: "三副本块", value: ov.replica_blocks ?? ov.blocks, sub: `每块 ×3 冗余`, cls: "" },
+    { label: "EC 分片 / 组", value: `${ov.ec_shard_blocks || 0} / ${ov.ec_groups || 0}`, sub: "纠删码 ×1.5 冗余", cls: "violet" },
     { label: "集群容量", value: fmtBytes(ov.capacity), sub: `${ov.nodes_live}/${ov.nodes_total} 节点在线`, cls: ov.nodes_dead ? "warn" : "ok" },
-    { label: "回收站", value: fmtBytes(ov.trash.bytes), sub: `${ov.trash.count} 项 · 保留 ${ov.trash.retention_days} 天`, cls: "" },
   ];
   document.getElementById("kpi-row").innerHTML = cells.map(c => `
     <div class="kpi ${c.cls}">
       <div class="k-label">${esc(c.label)}</div>
-      <div class="k-value">${esc(c.value)}</div>
+      <div class="k-value">${esc(String(c.value))}</div>
       <div class="k-sub">${esc(c.sub)}</div>
     </div>`).join("");
+}
+
+function renderStorageDist(ov) {
+  const rep = ov.replica_blocks ?? ov.blocks;
+  const ec = ov.ec_shard_blocks || 0;
+  const profiles = ov.ec_profiles || {};
+  const profRows = Object.entries(profiles).map(([name, n]) =>
+    `<div><span class="badge violet plain">${esc(name)}</span> <b class="mono">${n}</b> 个条带组</div>`).join("");
+  document.getElementById("storage-donut").innerHTML =
+    svgDonut([
+      { label: "三副本块", value: Math.max(1, rep), valueText: `${rep} 块` },
+      { label: "纠删码分片", value: Math.max(1, ec), valueText: `${ec} 分片` },
+    ], 150, 22, "", "冗余方式") +
+    legend([
+      { label: `三副本块 · ${rep}（×3）`, color: PALETTE[0] },
+      { label: `纠删码分片 · ${ec}（×1.5）`, color: "#b78cff" },
+    ]) +
+    `<div class="small muted" style="margin-top:8px">${profRows || "暂无纠删码组"}</div>`;
 }
 
 function renderCapacity(ov) {

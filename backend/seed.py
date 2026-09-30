@@ -368,6 +368,35 @@ def seed_cluster(nn, datanodes=None, verbose=True):
         nn.write_file_internal(path, data, author)
     say(f"  写入 {len(files_v1)} 个文件")
 
+    # 纠删码演示目录：目录策略切到 EC（2+1，3 节点即可放置）
+    say("创建纠删码（EC 2+1）演示目录 …")
+    with nn.meta.lock:
+        cold = nn.fs.mkdir("/", "cold-archive", "admin")
+        cold["storage_policy"] = "ec"
+        cold["ec_profile"] = "ec-2+1"
+        nn.meta.touch("fs")
+    cold_docs = {
+        "/cold-archive/quarterly-report.md": (
+            ("# 季度归档报告（纠删码存储）\n\n"
+             "本目录启用 EC 2+1：文件切成 2 个数据分片 + 1 个校验分片，\n"
+             "分别放在 3 个不同节点；任意一个节点损坏都可由其余分片还原，\n"
+             "空间开销仅 ×1.5（三副本为 ×3）。\n\n"
+             "## 验证方法\n"
+             "1. 文件浏览页打开本目录，查看文件详情中的分片分布；\n"
+             "2. 节点状态页杀死一个 DataNode，观察自动重建进度；\n"
+             "3. 期间文件仍可正常下载（任意 2 个分片即可还原）。\n"
+             + ("归档内容行 %04d — 冷数据适合用纠删码省空间。\n" * 400)
+             ).encode(), "admin"),
+        "/cold-archive/metrics-archive.csv": (
+            ("ts,metric,value,node\n" +
+             "".join(f"2026-09-{(i % 28) + 1:02d}T{i % 24:02d}:00:00,"
+                     f"disk_used,{1000 + i * 7},dn{i % 3 + 1}\n"
+                     for i in range(4000))).encode(), "admin"),
+    }
+    for path, (data, author) in cold_docs.items():
+        nn.write_file_internal(path, data, author)
+    say(f"  写入 {len(cold_docs)} 个 EC 文件（与三副本文件并存）")
+
     say("构建版本历史 …")
     nn.versions.commit("init: 初始化仓库（文档/代码/数据/图片）", "admin")
 

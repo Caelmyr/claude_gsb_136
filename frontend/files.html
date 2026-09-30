@@ -40,6 +40,7 @@
           <div class="toolbar">
             <div class="breadcrumb" id="breadcrumb"></div>
             <div class="spacer"></div>
+            <button class="btn sm" id="btn-policy" title="按目录切换冗余方式">🔀 冗余策略</button>
             <button class="btn sm" id="btn-mkdir">＋ 新建目录</button>
             <a class="btn sm" id="btn-upload" href="transfer.html">⇧ 上传文件</a>
             <button class="btn sm ghost" id="btn-refresh">⟳</button>
@@ -73,6 +74,21 @@ let currentPath = DFSVS.qs("path", "/");
 let selected = null;      // 当前选中条目
 let expanded = new Set(["/"]);
 
+// 冗余方式徽标：三副本 / 纠删码
+function storageTag(storage, profile) {
+  if (storage === "ec") {
+    const p = (profile || "ec").replace("ec-", "");
+    return `<span class="badge violet plain" title="纠删码（数据分片+校验分片）">🧩 EC ${esc(p)}</span>`;
+  }
+  return `<span class="badge acc plain" title="三副本">⧉ 3 副本</span>`;
+}
+function dirPolicyMark(node) {
+  if (node.type !== "dir" || !node.storage_policy) return "";
+  return node.storage_policy === "ec"
+    ? `<span class="badge violet plain" style="font-size:10px;padding:0 5px" title="目录策略：纠删码 ${esc(node.ec_profile || "")}">EC</span>`
+    : `<span class="badge acc plain" style="font-size:10px;padding:0 5px" title="目录策略：三副本">3×</span>`;
+}
+
 // ------------------------------------------------------------------ 目录树
 async function loadTree() {
   const data = await api("GET", "/api/fs/tree");
@@ -92,7 +108,7 @@ function buildTreeNode(node, path) {
   row.innerHTML = `
     <span class="tw">${isDir ? (isOpen ? "▾" : "▸") : ""}</span>
     <span>${isDir ? (isOpen ? "🗂" : "🗀") : fileIcon(node)}</span>
-    <span class="tn">${esc(node.name)}</span>
+    <span class="tn">${esc(node.name)} ${dirPolicyMark(node)}</span>
     <span class="ts">${isDir ? (node.file_count ?? "") : fmtBytes(node.size)}</span>`;
   row.onclick = (e) => {
     e.stopPropagation();
@@ -150,12 +166,13 @@ function renderGrid(items) {
   }
   grid.innerHTML = items.map((it, i) => `
     <div class="fcard ${selected && selected.path === it.path ? "sel" : ""}" data-i="${i}">
-      ${it.type === "file" ? `<span class="health-dot ${it.health || "ok"}" title="副本健康: ${it.health || "ok"}"></span>` : ""}
+      ${it.type === "file" ? `<span class="health-dot ${it.health || "ok"}" title="冗余健康: ${it.health || "ok"}"></span>` : ""}
       <div class="thumb">
         ${it.thumb ? `<img loading="lazy" src="${esc(thumbUrl(it.path))}" alt="" onerror="this.parentElement.textContent='🖼'">` : fileIcon(it)}
       </div>
       <div class="fname">${esc(it.name)}</div>
       <div class="fmeta">${it.type === "dir" ? (it.children + " 项") : fmtBytes(it.size)} · ${fmtAgo(it.modified_at)}</div>
+      ${it.type === "file" ? `<div class="fmeta" style="margin-top:2px">${storageTag(it.storage, it.ec_profile)}</div>` : ""}
     </div>`).join("");
   grid.querySelectorAll(".fcard").forEach(el => {
     const it = items[+el.dataset.i];
@@ -197,6 +214,8 @@ async function selectEntry(it) {
           <div class="kv">
             <span class="k">路径</span><span class="v">${esc(s.path)}</span>
             <span class="k">类型</span><span class="v">${s.type === "dir" ? "目录" : esc(s.mime || "文件")}</span>
+            <span class="k">冗余方式</span><span class="v">${storageTag(s.storage, s.ec_profile)}
+              ${s.storage === "ec" ? `<span class="small muted">任意 ${ecTol(s.ec_profile)} 个分片存活即可还原</span>` : '<span class="small muted">同一份数据存 3 份</span>'}</span>
             <span class="k">大小</span><span class="v">${fmtBytes(s.size)}（${s.size} B）</span>
             <span class="k">内容哈希</span><span class="v">${esc((s.content_hash || "-").slice(0, 24))}…</span>
             <span class="k">属主 / 模式</span><span class="v">${esc(s.owner)} · ${esc(s.mode)}</span>
@@ -213,6 +232,7 @@ async function selectEntry(it) {
           </div>
         </div>
         <div class="side grow">
+          ${blocks.storage === "ec" ? renderEcDetail(blocks) : `
           <div class="small muted" style="margin-bottom:6px">
             块与副本（${blocks.blocks.length} 块 · 逻辑 ${fmtBytes(blocks.size)}）</div>
           <div class="table-wrap scroll-y" style="max-height:300px">
@@ -231,9 +251,10 @@ async function selectEntry(it) {
                           title="genstamp #${r.genstamp} · ${r.rack || ""}">${esc(r.node)}${r.state !== "ok" ? ":" + esc(r.state) : ""}</span>`).join(" ") || '<span class="muted">无</span>'}</td>
                 </tr>`).join("")}
             </tbody>
-          </table></div>
+          </table></div>`}
         </div>
       </div>`;
+    if (blocks.storage === "ec") bindEcPolling(s.path);
     document.getElementById("d-preview").onclick = () => previewFile(s);
     document.getElementById("d-download").onclick = () =>
       location.href = DFSVS.downloadUrl(s.path);
@@ -244,6 +265,83 @@ async function selectEntry(it) {
   } catch (e) {
     body.innerHTML = `<div class="empty small">加载详情失败：${esc(e.message)}</div>`;
   }
+}
+
+// EC 容错数文案
+function ecTol(profile) {
+  const m = String(profile || "ec-2+1").split("+")[1] || "1";
+  return m;
+}
+function ecStatusBadge(st) {
+  if (st === "healthy") return '<span class="badge ok plain">健康</span>';
+  if (st === "degraded") return '<span class="badge warn plain">降级·自动修复中</span>';
+  return '<span class="badge bad plain">危急·可用分片不足</span>';
+}
+
+// EC 文件详情：每组 k+m 分片矩阵（数据/校验、落点节点、修复进度）
+function renderEcDetail(blocks) {
+  const totalShards = blocks.groups.reduce((a, g) => a + (g.k + g.m), 0);
+  const logical = fmtBytes(blocks.size);
+  const groupsHtml = blocks.groups.map((g, gi) => {
+    const rb = g.rebuild;
+    const progress = rb ? (rb.progress || `${(rb.done||[]).length}/${rb.missing_total}`) : null;
+    return `
+    <div style="border:1px solid var(--border-soft);border-radius:8px;padding:8px 10px;margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <b class="small">条带组 #${gi+1}</b>
+        <span class="mono small muted">${esc(g.short)}</span>
+        <span class="badge dim plain">${esc(g.profile)} · ${g.k}+${g.m}</span>
+        ${ecStatusBadge(g.status)}
+        <span class="mono small">可用分片 ${g.available}/${g.k + g.m}</span>
+        <span class="spacer"></span>
+        <span class="small muted">逻辑 ${fmtBytes(g.data_len)} · 每分片 ${fmtBytes(g.shard_size)}</span>
+      </div>
+      ${g.status !== "healthy" ? `
+      <div class="small" style="margin:4px 0">
+        ${progress ? `<span class="badge warn plain">自动修复进度 ${esc(progress)}</span>` : '<span class="badge dim plain">等待调度…</span>'}
+        ${rb && rb.last_error ? `<span class="small bad">${esc(rb.last_error)}</span>` : ""}
+      </div>
+      <div class="pbar thin ${g.status === "critical" ? "bad" : "warn"}" style="margin:4px 0 8px">
+        <i style="width:${Math.round(((rb?.done||[]).length / Math.max(1, rb?.missing_total||1))*100)}%"></i></div>` : ""}
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${g.shards.map(sh => `
+          <div class="ec-shard ${sh.state}" title="${esc(sh.checksum)}…">
+            <div class="es-idx">${sh.kind === "data" ? "D" : "P"}${sh.index < g.k ? sh.index : sh.index - g.k}</div>
+            <div class="es-node">${sh.state === "ok" ? esc(sh.nodes.join(",")) :
+              sh.state === "recovering" ? "→ " + esc(sh.recovering_to || "?") : "缺失"}</div>
+          </div>`).join("")}
+      </div>
+    </div>`;
+  }).join("");
+  return `
+    <div class="small muted" style="margin-bottom:6px">
+      纠删码分片（${blocks.groups.length} 个条带组 · ${totalShards} 个分片 · 逻辑 ${logical}）
+      · 空间开销 ×1.5，任意分片损坏可自动还原
+    </div>
+    <div class="scroll-y" style="max-height:330px">${groupsHtml}</div>`;
+}
+
+// EC 详情打开期间，若非健康态则 2.5s 轮询刷新进度（只读抽屉打开时）
+let ecPollStop = null;
+function bindEcPolling(path) {
+  if (ecPollStop) { ecPollStop(); ecPollStop = null; }
+  let stop = false;
+  const tick = async () => {
+    if (stop) return;
+    try {
+      const d = await api("GET", "/api/file/blocks?path=" + encodeURIComponent(path));
+      if (d.storage !== "ec" || d.status === "healthy") { stop = true; return; }
+      if (!document.getElementById("detail-card") ||
+          document.getElementById("detail-card").style.display === "none") {
+        stop = true; return;
+      }
+      const box = document.querySelector("#detail-body");
+      if (box) box.querySelectorAll(".side.grow")[1].innerHTML = renderEcDetail(d);
+    } catch (e) {}
+    setTimeout(tick, 2500);
+  };
+  setTimeout(tick, 2500);
+  ecPollStop = () => { stop = true; };
 }
 
 async function previewFile(it) {
@@ -288,6 +386,78 @@ function deleteEntry(it) {
     } catch (e) { toast("删除失败：" + e.message, "bad"); }
   }, true);
 }
+
+// ------------------------------------------------------------------ 目录冗余策略
+document.getElementById("btn-policy").onclick = async () => {
+  let view;
+  try {
+    view = await api("GET", "/api/fs/storage_policy?path=" + encodeURIComponent(currentPath));
+  } catch (e) { toast("加载策略失败：" + e.message, "bad"); return; }
+  const cur = view.policy;
+  const profCards = view.profiles.map(p => `
+    <label class="prof-card ${p.name === view.ec_profile ? "sel" : ""} ${p.fits ? "" : "nofit"}">
+      <input type="radio" name="prof" value="${esc(p.name)}" ${p.fits ? "" : "disabled"}
+             ${p.name === view.ec_profile ? "checked" : ""}>
+      <div>
+        <div><b>${esc(p.label)}</b>
+          <span class="badge dim plain">需 ${p.nodes_required} 节点</span>
+          <span class="badge ok plain">开销 ×${p.overhead}</span>
+          ${p.fits ? "" : '<span class="badge bad plain">节点不足</span>'}</div>
+        <div class="small muted">${esc(p.desc)}</div>
+      </div>
+    </label>`).join("");
+  const html = `
+    <div class="small muted" style="margin-bottom:10px">
+      当前目录：<b class="mono">${esc(view.path)}</b> · 存活节点 ${view.live_nodes}
+    </div>
+    <div class="prof-opt">
+      <label class="prof-line ${cur === "replica" ? "sel" : ""}">
+        <input type="radio" name="pol" value="replica" ${cur === "replica" ? "checked" : ""}>
+        <div><b>⧉ 三副本</b> <span class="small muted">每份数据存 3 份（×3），读取/恢复快</span></div>
+      </label>
+      <label class="prof-line ${cur === "ec" ? "sel" : ""}">
+        <input type="radio" name="pol" value="ec" ${cur === "ec" ? "checked" : ""}>
+        <div><b>🧩 纠删码</b> <span class="small muted">数据分片+校验分片（×1.5），更省空间</span></div>
+        <div id="prof-list" style="margin-top:8px">${profCards}</div>
+      </label>
+      <label class="prof-line ${view.is_inherited ? "sel" : ""}">
+        <input type="radio" name="pol" value="inherit" ${view.is_inherited ? "checked" : ""}>
+        <div><b>↧ 跟随上级目录</b>
+          <span class="small muted">继承 <b class="mono">${esc(view.effective.inherited_from || "系统默认（三副本）")}</b> 的策略</span></div>
+      </label>
+    </div>
+    <hr class="hr">
+    <div class="small" style="color:var(--warn)">
+      ⓵ 切换只影响之后<b>新写入/覆盖</b>的文件；已有文件保持原冗余、可正常读写，
+      两种冗余方式会在同一目录下并存、互不干扰。</div>`;
+  modal({
+    title: `🔀 目录冗余策略 · ${view.path}`, body: html, wide: true,
+    okText: "保存策略",
+    onOk: async (bodyEl) => {
+      const pol = bodyEl.querySelector("input[name=pol]:checked").value;
+      const profEl = bodyEl.querySelector("input[name=prof]:checked");
+      try {
+        const r = await api("POST", "/api/fs/storage_policy", {
+          path: currentPath, policy: pol,
+          profile: pol === "ec" ? (profEl ? profEl.value : "ec-2+1") : null,
+        });
+        toast("冗余策略已更新（旧文件保持不变）", "ok");
+        refresh();
+      } catch (e) { toast("保存失败：" + e.message, "bad"); return false; }
+    }
+  });
+  // 选中样式联动
+  document.querySelectorAll(".prof-opt input[name=pol]").forEach(r =>
+    r.addEventListener("change", () => {
+      document.querySelectorAll(".prof-line").forEach(l => l.classList.remove("sel"));
+      r.closest(".prof-line").classList.add("sel");
+    }));
+  document.querySelectorAll(".prof-card input").forEach(r =>
+    r.addEventListener("change", () => {
+      document.querySelectorAll(".prof-card").forEach(l => l.classList.remove("sel"));
+      r.closest(".prof-card").classList.add("sel");
+    }));
+};
 
 document.getElementById("btn-mkdir").onclick = () => {
   promptDlg("新建目录", [

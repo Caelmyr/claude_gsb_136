@@ -170,14 +170,36 @@ def api_sessions(ctx):
 # ============================================================================
 
 def _annotate_health(nn, entries):
-    """给目录列表中的文件补充副本健康度。"""
+    """给目录列表中的文件补充副本/纠删码健康度。"""
     with nn.meta.lock:
         blocks = nn.meta.get("blocks")["blocks"]
+        ec_doc = nn.meta.get("ec_groups")
         for e in entries:
             if e["type"] != "file":
                 continue
             inode = nn.fs.get_inode(e["id"])
             if not inode:
+                continue
+            if inode.get("storage") == "ec":
+                # EC：按组可用分片数判定
+                worst = "ok"
+                avail_min = None
+                for gid in inode.get("ec_groups", []):
+                    grp = ec_doc["groups"].get(gid)
+                    if not grp:
+                        worst = "missing"
+                        avail_min = 0
+                        break
+                    st = nn.ec_group_state_readonly(gid)
+                    n = st["available"]
+                    total = st["k"] + st["m"]
+                    avail_min = n if avail_min is None else min(avail_min, n)
+                    if n < st["k"]:
+                        worst = "missing"
+                    elif n < total and worst != "missing":
+                        worst = "under"
+                e["health"] = worst
+                e["live_replicas"] = avail_min
                 continue
             worst = "ok"
             live_min = None
@@ -294,6 +316,44 @@ def api_file_blocks(ctx):
 
 
 # ============================================================================
+# API: 存储策略（三副本 / 纠删码，按目录切换）
+# ============================================================================
+
+@route("GET", "/api/fs/storage_policy")
+def api_fs_storage_policy_get(ctx):
+    path = ctx.query.get("path", "/")
+    ctx.require_perm(path, "read")
+    return ctx.nn.get_storage_policy_view(path)
+
+
+@route("POST", "/api/fs/storage_policy")
+def api_fs_storage_policy_set(ctx):
+    body = ctx.json()
+    path = body.get("path", "/")
+    ctx.require_perm(path, "write")
+    result = ctx.nn.set_storage_policy(
+        path, body.get("policy", ""), body.get("profile"), ctx.actor())
+    return result
+
+
+@route("GET", "/api/ec/groups")
+def api_ec_groups(ctx):
+    limit = min(ctx.q_int("limit", 200), 1000)
+    return ctx.nn.ec_groups_view(limit)
+
+
+@route("GET", "/api/ec/group")
+def api_ec_group(ctx):
+    gid = ctx.query.get("id", "")
+    st = ctx.nn.ec_group_state_readonly(gid)
+    if not st:
+        raise ApiError(404, f"纠删码组不存在: {gid}")
+    group = ctx.nn._ec_group(gid)
+    return {"group": group, "state": st,
+            "paths": ctx.nn.block_paths(gid, ec_group_only=True)}
+
+
+# ============================================================================
 # API: 上传（分块 + 断点续传）
 # ============================================================================
 
@@ -307,7 +367,9 @@ def api_upload_begin(ctx):
     view = ctx.nn.upload_begin(path, filename, size,
                                session_id=body.get("session"),
                                piece_size=body.get("piece_size"),
-                               user=ctx.actor())
+                               user=ctx.actor(),
+                               storage=body.get("storage"),
+                               ec_profile=body.get("ec_profile"))
     return view
 
 
@@ -857,6 +919,10 @@ def api_system_info(ctx):
             "chunk_strategy": config.CHUNK_STRATEGY,
             "trash_retention_days": config.TRASH_RETENTION_DAYS,
             "upload_piece_size": config.UPLOAD_PIECE_SIZE,
+            "default_storage_policy": config.DEFAULT_STORAGE_POLICY,
+            "ec_profiles": {n: {"k": p["k"], "m": p["m"],
+                                "label": p["label"], "desc": p["desc"]}
+                            for n, p in config.EC_PROFILES.items()},
         },
         "nodes": {nid: n["state"] for nid, n in nn.nodes.items()},
         "authed": bool(ctx.token and nn.auth.user_for_token(ctx.token)),
