@@ -73,6 +73,31 @@ GENSTAMP_INITIAL = 1                   # 块版本号（generation stamp）初�
 RECOVERY_TRIGGER = "min"               # 恢复队列触发口径
 
 # ----------------------------------------------------------------------------
+# 纠删码（Erasure Coding，省空间的第二种冗余方式）
+# ----------------------------------------------------------------------------
+# 两种冗余策略：
+#   rep  replication —— 三副本（默认）：3× 空间，恢复即拷贝，热数据友好
+#   ec   erasure-coded —— 数据分片 k + 校验分片 m：(k+m)/k× 空间，
+#                        任意 m 个分片损坏均可由其余分片编码还原
+REDUNDANCY_REP = "rep"
+REDUNDANCY_EC = "ec"
+DEFAULT_REDUNDANCY = REDUNDANCY_REP
+
+# 可选 EC 方案（k 个数据分片 + m 个校验分片，需 k+m 个节点）
+EC_PROFILES = {
+    "2+1": {"k": 2, "m": 1, "label": "RS(2,1)", "overhead": 1.5},
+    "2+2": {"k": 2, "m": 2, "label": "RS(2,2)", "overhead": 2.0},
+    "3+2": {"k": 3, "m": 2, "label": "RS(3,2)", "overhead": 1.667},
+    "4+2": {"k": 4, "m": 2, "label": "RS(4,2)", "overhead": 1.5},
+    "6+3": {"k": 6, "m": 3, "label": "RS(6,3)", "overhead": 1.5},
+}
+EC_PROFILE_DEFAULT = "2+1"             # 3 节点默认集群可用；4 节点可升 2+2
+EC_MAX_SHARDS = 8                      # k+m 上限（RS 矩阵/教学规模约束）
+EC_REPAIR_TIMEOUT = 40.0               # EC 分片重建任务超时（秒），超时重排
+EC_CONVERT_CONCURRENCY = 2             # 目录切换冗余方式时，后台并行转换的块数
+EC_CONVERT_INTERVAL = 1.0              # 转换调度扫描间隔（秒）
+
+# ----------------------------------------------------------------------------
 # 心跳 / 汇报 / 巡检 / 恢复（难点二：故障检测与自动恢复）
 # ----------------------------------------------------------------------------
 HEARTBEAT_INTERVAL = 1.5               # DataNode 心跳间隔（秒）
@@ -180,7 +205,8 @@ LOG_MAX_ENTRIES = 5000                  # logs.json 中最多保留的条数
 LOG_LEVELS = ["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
 LOG_LEVEL_SEP = "|"                     # 日志级别多选过滤的分隔符
 LOG_SOURCES = ["namenode", "datanode", "api", "auth", "fs", "block", "version",
-               "recovery", "gc", "sync", "upload", "download", "sim"]
+               "recovery", "gc", "sync", "upload", "download", "sim",
+               "ec", "convert"]
 
 # ----------------------------------------------------------------------------
 # 演示 / 模拟

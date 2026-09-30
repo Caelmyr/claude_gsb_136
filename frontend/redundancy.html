@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>冗余策略 · DFSVS</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  .red-kpi { display:flex; gap:14px; flex-wrap:wrap; }
+  .mode-card { flex:1 1 240px; border:1px solid var(--border); border-radius:var(--radius);
+               background:var(--panel); padding:16px 18px; position:relative; overflow:hidden; }
+  .mode-card .bar { position:absolute; left:0; top:0; bottom:0; width:4px; }
+  .mode-card.rep .bar { background:#4f8cff; }
+  .mode-card.ec .bar { background:#2fbf71; }
+  .mode-card h3 { margin:0 0 4px; font-size:15px; }
+  .mode-card .big { font-size:26px; font-weight:700; margin:6px 0 2px; }
+  .mode-card .sub2 { color:var(--muted); font-size:12px; }
+  .shard-cell { display:inline-flex; align-items:center; gap:4px; margin:2px 3px 2px 0;
+                padding:2px 7px; border-radius:6px; font-size:11.5px; font-family:var(--mono);
+                border:1px solid var(--border); background:#121827; }
+  .shard-cell.data { border-color:rgba(79,140,255,.45); color:#a9c6ff; }
+  .shard-cell.parity { border-color:rgba(47,191,113,.45); color:#9be8c0; }
+  .shard-cell.bad { border-color:rgba(229,83,75,.6); color:#ff9c97; }
+  .shard-cell .dot { width:7px;height:7px;border-radius:50%;background:var(--ok); }
+  .shard-cell .dot.off { background:var(--bad); }
+  .shard-cell .dot.warn { background:var(--warn); }
+  .prog { height:7px; border-radius:5px; background:#121827; overflow:hidden; margin:5px 0; }
+  .prog > i { display:block; height:100%; background:linear-gradient(90deg,#2fbf71,#4f8cff); transition:width .4s; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar" class="sidebar"></aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">冗余策略</h1>
+        <div class="sub" id="page-sub">三副本 vs 纠删码（Reed-Solomon）· 按目录切换 · 后台无损转换</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="userchip" id="userchip"></div>
+    </header>
+
+    <section class="content">
+      <!-- 两种冗余总览 -->
+      <div class="red-kpi" id="kpi-row" style="margin-bottom:16px"></div>
+
+      <div class="split-view">
+        <div class="side grow">
+          <!-- 目录策略 -->
+          <div class="card">
+            <div class="card-title">目录冗余策略
+              <span class="hint">新建文件按所在目录策略落盘；子目录可覆盖</span>
+              <span class="spacer"></span>
+              <button class="btn xs ghost" id="btn-refresh-dirs">⟳</button>
+            </div>
+            <div class="table-wrap scroll-y" style="max-height:300px">
+              <table class="tbl">
+                <thead><tr><th>目录</th><th>当前策略</th><th class="right">文件</th>
+                  <th class="right">逻辑大小</th><th>设置人 / 时间</th><th></th></tr></thead>
+                <tbody id="dirs-body"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 转换任务 -->
+          <div class="card">
+            <div class="card-title">冗余方式转换任务
+              <span class="hint">旧块保留（历史版本可读，GC 宽限期后回收），读写不中断</span>
+              <span class="spacer"></span>
+              <button class="btn xs ghost" id="btn-refresh-conv">⟳</button>
+            </div>
+            <div id="conv-box"></div>
+          </div>
+
+          <!-- EC 重建队列 -->
+          <div class="card">
+            <div class="card-title">EC 分片自动修复
+              <span class="hint">损坏/丢失分片由 NameNode 在线重建</span>
+            </div>
+            <div id="repair-box"></div>
+          </div>
+        </div>
+
+        <div class="side fixed" style="width:330px;flex-basis:330px">
+          <div class="card">
+            <div class="card-title">纠删码方案</div>
+            <div id="profiles-box" class="small"></div>
+            <hr class="hr">
+            <div class="small muted">
+              <p style="margin:6px 0"><b style="color:#a9c6ff">三副本（rep）</b>：3× 空间，
+                块整份复制 3 份，恢复即拷贝，适合热数据。</p>
+              <p style="margin:6px 0"><b style="color:#9be8c0">纠删码（ec）</b>：文件拆成
+                <b>k 个数据分片 + m 个校验分片</b>，分散到 k+m 个节点；
+                任意 m 个分片损坏都能由其余分片通过 RS 编码还原，
+                空间仅 (k+m)/k×。</p>
+              <p style="margin:6px 0">同一目录下两种冗余可并存，互不干扰。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="js/app.js"></script>
+<script>
+"use strict";
+const { api, esc, fmtBytes, fmtTs, fmtAgo, toast, confirmDlg, modal } = DFSVS;
+
+let profilesCfg = {};
+
+// ------------------------------------------------------------------ 总览
+async function loadOverview() {
+  const d = await api("GET", "/api/redundancy/overview");
+  profilesCfg = d.profiles || {};
+  const repOH = d.logical_rep ? (d.physical_rep / d.logical_rep) : 0;
+  const ecOH = d.logical_ec ? (d.physical_ec / d.logical_ec) : 0;
+  document.getElementById("kpi-row").innerHTML = `
+    <div class="mode-card rep"><div class="bar"></div>
+      <h3>三副本（replication）</h3>
+      <div class="big">${d.files_rep} <span class="small muted">文件</span></div>
+      <div class="sub2">逻辑 ${fmtBytes(d.logical_rep)} · 物理 ${fmtBytes(d.physical_rep)}（≈${repOH.toFixed(2)}×）</div>
+    </div>
+    <div class="mode-card ec"><div class="bar"></div>
+      <h3>纠删码（erasure coding）</h3>
+      <div class="big">${d.files_ec} <span class="small muted">文件</span></div>
+      <div class="sub2">逻辑 ${fmtBytes(d.logical_ec)} · 物理 ${fmtBytes(d.physical_ec)}（≈${ecOH.toFixed(2)}×）</div>
+      <div class="sub2" style="margin-top:4px">
+        ${Object.entries(d.ec_profiles || {}).map(([p, n]) =>
+          `<span class="badge plain ok">RS ${esc(p)} ×${n}</span>`).join(" ") || '<span class="muted">无</span>'}
+        ${d.files_mixed ? `<span class="badge plain warn">混合 ${d.files_mixed}</span>` : ""}
+      </div>
+    </div>
+    <div class="mode-card"><div class="bar" style="background:var(--warn)"></div>
+      <h3>EC 健康</h3>
+      <div class="big">${d.ec_health.repairing} <span class="small muted">重建中</span></div>
+      <div class="sub2">退化 ${d.ec_health.degraded} · 不可解码 ${d.ec_health.missing}</div>
+    </div>`;
+  renderProfiles(d.profiles);
+}
+
+function renderProfiles(profiles) {
+  const box = document.getElementById("profiles-box");
+  box.innerHTML = Object.entries(profiles || {}).map(([name, p]) => `
+    <div style="padding:8px 4px;border-bottom:1px solid var(--border)">
+      <b>${esc(p.label)}</b>
+      <span class="muted"> · k=${p.k} 数据 + m=${p.m} 校验 · ${p.k + p.m} 节点 · ${p.overhead}× 空间</span>
+    </div>`).join("");
+}
+
+// ------------------------------------------------------------------ 目录
+async function loadDirs() {
+  const d = await api("GET", "/api/redundancy/dirs");
+  profilesCfg = d.profiles || profilesCfg;
+  const body = document.getElementById("dirs-body");
+  body.innerHTML = d.dirs.map(r => `
+    <tr>
+      <td class="mono"><a href="files.html?path=${encodeURIComponent(r.path)}">${esc(r.path)}</a>
+          ${r.is_root ? '<span class="badge dim plain">根</span>' : ""}
+          ${!r.explicit ? '<span class="badge dim plain">继承</span>' : ""}</td>
+      <td>${r.redundancy === "ec"
+          ? `<span class="badge ok plain">纠删码 RS ${esc(r.ec_profile || "?")}</span>`
+          : '<span class="badge" style="background:rgba(79,140,255,.18)">三副本</span>'}</td>
+      <td class="num right">${r.files}</td>
+      <td class="num right">${fmtBytes(r.bytes)}</td>
+      <td class="small dim">${r.updated_by ? esc(r.updated_by) + " · " + fmtTs(r.updated_at) : "—"}</td>
+      <td class="right">
+        ${r.is_root ? "" : `
+        <button class="btn xs ghost set-rep" data-p="${esc(r.path)}">三副本</button>
+        <button class="btn xs ghost set-ec" data-p="${esc(r.path)}">纠删码</button>`}
+      </td>
+    </tr>`).join("");
+  body.querySelectorAll(".set-rep").forEach(b => b.onclick = () => askPolicy(b.dataset.p, "rep"));
+  body.querySelectorAll(".set-ec").forEach(b => b.onclick = () => askPolicy(b.dataset.p, "ec"));
+}
+
+function askPolicy(path, mode) {
+  const profOptions = Object.entries(profilesCfg).map(([name, p]) =>
+    `<option value="${esc(name)}">${esc(p.label)}（${p.k}+${p.m}，${p.overhead}×）</option>`).join("");
+  const body = document.createElement("div");
+  body.innerHTML = `
+    <div class="small muted" style="margin-bottom:10px">目录 <b class="mono">${esc(path)}</b></div>
+    <label class="fl">冗余方式
+      <select id="p-mode">
+        <option value="rep" ${mode === "rep" ? "selected" : ""}>三副本（3×，热数据）</option>
+        <option value="ec" ${mode === "ec" ? "selected" : ""}>纠删码（省空间）</option>
+      </select></label>
+    <label class="fl ec-only">EC 方案
+      <select id="p-profile">${profOptions}</select></label>
+    <label class="fl"><input type="checkbox" id="p-rec" checked> 同时把目录下<b>已有文件</b>后台转换（旧数据无损、读写不中断）</label>
+    <div class="small muted" id="p-hint" style="margin-top:6px"></div>`;
+  const syncVis = () => {
+    body.querySelectorAll(".ec-only").forEach(el =>
+      el.style.display = body.querySelector("#p-mode").value === "ec" ? "" : "none");
+  };
+  body.querySelector("#p-mode").onchange = syncVis; syncVis();
+  modal({
+    title: "切换目录冗余方式", body, okText: "应用",
+    onOk: async () => {
+      const redundancy = body.querySelector("#p-mode").value;
+      const ecProfile = body.querySelector("#p-profile").value;
+      const recursive = body.querySelector("#p-rec").checked;
+      try {
+        const r = await api("POST", "/api/redundancy/policy", {
+          path, redundancy, ec_profile: ecProfile, recursive });
+        toast(`已应用${recursive && r.conversion ? "，转换任务 " + r.conversion.id.slice(-6) + " 后台进行中" : ""}`, "ok");
+        loadDirs(); loadConversions();
+      } catch (e) { toast("设置失败：" + e.message, "bad"); return false; }
+    }
+  });
+}
+
+// ------------------------------------------------------------------ 转换任务
+async function loadConversions() {
+  const d = await api("GET", "/api/redundancy/conversions");
+  const box = document.getElementById("conv-box");
+  if (!d.jobs.length) { box.innerHTML = '<div class="empty small">暂无转换任务</div>'; return; }
+  box.innerHTML = d.jobs.slice(0, 10).map(j => {
+    const pct = j.total ? Math.round((j.converted + j.failed) / j.total * 100) : 100;
+    const badge = j.state === "done"
+      ? '<span class="badge ok plain">已完成</span>'
+      : '<span class="badge warn plain">进行中</span>';
+    return `<div style="padding:9px 4px;border-bottom:1px solid var(--border)">
+      <div class="small"><b class="mono">${esc(j.path)}</b> →
+        ${j.to === "ec" ? '<span class="badge ok plain">纠删码 ' + esc(j.ec_profile||"") + '</span>' : '<span class="badge" style="background:rgba(79,140,255,.18)">三副本</span>'}
+        ${badge} <span class="muted">${esc(j.id.slice(-8))}</span>
+        <span class="spacer"></span>${j.converted}/${j.total} 完成 · 失败 ${j.failed} · 跳过 ${j.skipped}
+        <button class="btn xs ghost conv-detail" data-j="${esc(j.id)}">详情</button></div>
+      <div class="prog"><i style="width:${pct}%"></i></div>
+      <div class="small dim">${fmtTs(j.created_at)} · ${esc(j.user || "")}</div>
+    </div>`;
+  }).join("");
+  box.querySelectorAll(".conv-detail").forEach(b => b.onclick = () => showConv(b.dataset.j));
+}
+
+async function showConv(jobId) {
+  const d = await api("GET", "/api/redundancy/conversion/" + encodeURIComponent(jobId));
+  const j = d.job;
+  const stMap = { done: ["ok", "完成"], pending: ["dim", "等待"], running: ["warn", "转换中"],
+                  failed: ["bad", "失败"], skipped: ["dim", "已是目标方式"] };
+  modal({
+    title: `转换任务 ${j.id.slice(-8)}`, wide: true, hideCancel: true, okText: "关闭",
+    body: `<div class="small" style="margin-bottom:8px">
+        <b class="mono">${esc(j.path)}</b> → ${j.to === "ec" ? "纠删码 " + esc(j.ec_profile||"") : "三副本"}
+        · ${j.converted}/${j.total} · 失败 ${j.failed}</div>
+      <div class="table-wrap scroll-y" style="max-height:55vh">
+      <table class="tbl"><thead><tr><th>文件</th><th>原方式</th><th>目标</th>
+          <th class="right">块</th><th>状态</th><th>说明</th></tr></thead><tbody>
+        ${d.items.map(it => {
+          const [cls, label] = stMap[it.status] || ["dim", it.status];
+          return `<tr>
+            <td class="mono small">${esc(it.path)}</td>
+            <td>${it.from === "ec" ? "纠删码" : it.from === "rep" ? "三副本" : esc(it.from)}</td>
+            <td>${it.to === "ec" ? "纠删码" : "三副本"}</td>
+            <td class="num right">${it.blocks}</td>
+            <td><span class="badge ${cls} plain">${label}</span></td>
+            <td class="small dim">${esc(it.error || "")}</td></tr>`;
+        }).join("")}
+      </tbody></table></div>`
+  });
+}
+
+// ------------------------------------------------------------------ EC 修复
+async function loadRepairs() {
+  const q = await api("GET", "/api/health/queue");
+  const box = document.getElementById("repair-box");
+  const items = q.ec_groups || [];
+  const summary = `<div class="small" style="margin-bottom:8px">
+    <span class="badge ${q.counts.ec_degraded ? "warn" : "ok"}">退化 ${q.counts.ec_degraded}</span>
+    <span class="badge ${q.counts.ec_missing ? "bad" : "ok"}">不可解码 ${q.counts.ec_missing}</span>
+    <span class="badge ${q.counts.ec_repairing ? "acc" : "dim"}">重建中 ${q.counts.ec_repairing}</span>
+  </div>`;
+  if (!items.length) {
+    box.innerHTML = summary + '<div class="empty small">所有 EC 组分片齐全 🎉</div>';
+    return;
+  }
+  box.innerHTML = summary + `<div class="table-wrap scroll-y" style="max-height:260px">
+    <table class="tbl"><thead><tr><th>EC 组</th><th>方案</th><th>分片</th>
+        <th>进度</th><th>重建目标</th><th>状态</th></tr></thead><tbody>
+    ${items.map(g => {
+      const pct = g.total ? Math.round(g.finished / g.total * 100) : 0;
+      const status = g.live < g.k ? '<span class="badge bad plain">不可解码</span>'
+        : g.state === "running" ? '<span class="badge warn plain">重建中</span>'
+        : '<span class="badge dim plain">排队</span>';
+      return `<tr>
+        <td class="mono small" title="${esc(g.group)}">${esc(g.group.slice(-10))}</td>
+        <td>RS ${esc(g.profile || (g.k + "+" + g.m))}</td>
+        <td><span class="badge ${g.live < g.k ? "bad" : "warn"} plain">${g.live}/${g.desired}</span></td>
+        <td style="min-width:120px">${g.total ? `<div class="prog"><i style="width:${pct}%"></i></div>
+            <span class="small mono">${g.finished}/${g.total} (${pct}%)</span>` : '<span class="muted small">—</span>'}</td>
+        <td class="small mono">${(g.targets || []).join(",") || "—"}
+          ${g.missing && g.missing.length ? '<span class="dim"> 缺片[' + g.missing.join(",") + "]</span>" : ""}</td>
+        <td>${status}${g.last_error ? '<div class="small bad">' + esc(g.last_error) + "</div>" : ""}</td>
+      </tr>`;
+    }).join("")}
+  </tbody></table></div>`;
+}
+
+document.getElementById("btn-refresh-dirs").onclick = () => { loadDirs(); loadOverview(); };
+document.getElementById("btn-refresh-conv").onclick = loadConversions;
+
+initPage("redundancy.html", "冗余策略").then(async () => {
+  await Promise.all([loadOverview(), loadDirs(), loadConversions(), loadRepairs()]);
+  DFSVS.poll(() => Promise.all([loadOverview(), loadRepairs()]), 3000);
+  DFSVS.poll(loadConversions, 2500);
+});
+</script>
+</body>
+</html>

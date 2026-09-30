@@ -150,7 +150,10 @@ function renderGrid(items) {
   }
   grid.innerHTML = items.map((it, i) => `
     <div class="fcard ${selected && selected.path === it.path ? "sel" : ""}" data-i="${i}">
-      ${it.type === "file" ? `<span class="health-dot ${it.health || "ok"}" title="副本健康: ${it.health || "ok"}"></span>` : ""}
+      ${it.type === "file" ? `<span class="health-dot ${it.health || "ok"}" title="冗余健康: ${it.health || "ok"}"></span>` : ""}
+      ${it.type === "file" ? `<span class="red-badge ${it.redundancy_actual === "ec" ? "ec" : "rep"}"
+        title="冗余方式：${it.redundancy_actual === "ec" ? "纠删码 RS " + (it.ec_profile || "") : it.redundancy_actual === "mixed" ? "混合" : "三副本"}">
+        ${it.redundancy_actual === "ec" ? "EC" + (it.ec_profile ? " " + it.ec_profile : "") : it.redundancy_actual === "mixed" ? "混" : "3×"}</span>` : ""}
       <div class="thumb">
         ${it.thumb ? `<img loading="lazy" src="${esc(thumbUrl(it.path))}" alt="" onerror="this.parentElement.textContent='🖼'">` : fileIcon(it)}
       </div>
@@ -202,6 +205,7 @@ async function selectEntry(it) {
             <span class="k">属主 / 模式</span><span class="v">${esc(s.owner)} · ${esc(s.mode)}</span>
             <span class="k">创建 / 修改</span><span class="v">${fmtTs(s.created_at)} · ${fmtTs(s.modified_at)}</span>
             <span class="k">覆盖版本</span><span class="v">v${s.file_version}</span>
+            <span class="k">冗余方式</span><span class="v" id="d-redundancy">…</span>
             <span class="k">访问</span><span class="v">${s.access_count} 次 · 最近 ${fmtAgo(s.last_access)}</span>
           </div>
           <div class="btn-group" style="margin-top:14px">
@@ -214,13 +218,43 @@ async function selectEntry(it) {
         </div>
         <div class="side grow">
           <div class="small muted" style="margin-bottom:6px">
-            块与副本（${blocks.blocks.length} 块 · 逻辑 ${fmtBytes(blocks.size)}）</div>
+            ${blocks.redundancy_actual === "ec"
+              ? `纠删码 RS <b style="color:#9be8c0">${esc(blocks.ec_profile || "")}</b> · ${blocks.blocks.length} 条带组 · 逻辑 ${fmtBytes(blocks.size)}`
+              : blocks.redundancy_actual === "mixed"
+              ? `⚠ 混合冗余（${blocks.blocks.length} 块，转换进行中）· 逻辑 ${fmtBytes(blocks.size)}`
+              : `三副本 · ${blocks.blocks.length} 块 · 逻辑 ${fmtBytes(blocks.size)}`}
+            ${(blocks.repairs || []).length ? blocks.repairs.map(r =>
+              `<span class="badge warn plain" title="分片重建">修复 ${r.finished}/${r.total}</span>`).join("") : ""}
+          </div>
           <div class="table-wrap scroll-y" style="max-height:300px">
           <table class="tbl">
-            <thead><tr><th>块</th><th class="right">大小</th><th>genstamp</th><th>健康</th><th>副本（节点:状态）</th></tr></thead>
+            <thead><tr><th>${blocks.redundancy_actual === "ec" ? "条带组/分片" : "块"}</th>
+              <th class="right">大小</th><th>genstamp</th><th>健康</th>
+              <th>${blocks.redundancy_actual === "ec" ? "分片落位（D=数据 P=校验）" : "副本（节点:状态）"}</th></tr></thead>
             <tbody>
               ${blocks.blocks.map(b => b.missing ? `
-                <tr><td class="mono">${esc(b.id.slice(-8))}</td><td colspan="4"><span class="badge bad">块丢失</span></td></tr>` : `
+                <tr><td class="mono">${esc(b.id.slice(-8))}</td><td colspan="4"><span class="badge bad">${b.type === "ec" ? "EC 组" : "块"}丢失</span></td></tr>`
+                : b.type === "ec" ? `
+                <tr>
+                  <td class="mono" title="${esc(b.id)}\nRS ${b.k}+${b.m} · stripe ${b.stripe}\nsha256 ${esc(b.checksum)}…">
+                    <span class="badge ok plain" style="margin-bottom:3px">EC ${esc(b.profile || b.k + "+" + b.m)}</span><br>
+                    <span class="small">${esc(b.short)}</span></td>
+                  <td class="num right">${fmtBytes(b.size)}<br><span class="small muted">${b.k + b.m}×${fmtBytes(b.stripe)}</span></td>
+                  <td class="num">#${b.genstamp}</td>
+                  <td>${healthBadge(b.status === "degraded" ? "under" : b.status)}
+                    <span class="mono small">${b.live}/${b.desired}</span>
+                    ${b.repair && b.repair.state === "running" ? `<div class="small" style="color:var(--warn)">重建 ${b.repair.finished}/${b.repair.total}</div>` : ""}</td>
+                  <td>${b.shards.map(s => {
+                    const rep0 = s.nodes[0];
+                    const cls = s.kind === "data" ? "data" : "parity";
+                    const glyph = s.kind === "data" ? "D" : "P";
+                    if (!rep0) return `<span class="shard-cell ${cls} bad"><span class="dot off"></span>${glyph}${s.index} 丢失</span>`;
+                    const stateCls = rep0.state === "ok" && rep0.live ? "" : "bad";
+                    const dot = rep0.state === "ok" && rep0.live ? "" : '<span class="dot warn"></span>';
+                    return `<span class="shard-cell ${cls} ${stateCls}" title="分片 ${s.index}（${s.kind}）@ ${rep0.node} ${rep0.rack||""} · ${rep0.state}">
+                      ${dot || '<span class="dot"></span>'}${glyph}${s.index}·${esc(rep0.node)}</span>`;
+                  }).join(" ")}</td>
+                </tr>` : `
                 <tr>
                   <td class="mono" title="${esc(b.id)}\nsha256 ${esc(b.checksum)}…">${esc(b.short)}</td>
                   <td class="num right">${fmtBytes(b.size)}</td>
@@ -232,6 +266,9 @@ async function selectEntry(it) {
                 </tr>`).join("")}
             </tbody>
           </table></div>
+          <div class="btn-group" style="margin-top:8px">
+            <a class="btn sm ghost" href="redundancy.html">🧩 管理冗余策略</a>
+          </div>
         </div>
       </div>`;
     document.getElementById("d-preview").onclick = () => previewFile(s);
@@ -241,6 +278,16 @@ async function selectEntry(it) {
     document.getElementById("d-delete").onclick = () => deleteEntry(s);
     document.getElementById("d-history").onclick = () =>
       location.href = "versions.html?path=" + encodeURIComponent(s.path);
+    // 冗余方式徽标
+    const redEl = document.getElementById("d-redundancy");
+    if (redEl) {
+      if (blocks.redundancy_actual === "ec")
+        redEl.innerHTML = `<span class="badge ok plain">纠删码 RS ${esc(blocks.ec_profile || "")}</span>`;
+      else if (blocks.redundancy_actual === "mixed")
+        redEl.innerHTML = '<span class="badge warn plain">混合（转换中）</span>';
+      else
+        redEl.innerHTML = '<span class="badge" style="background:rgba(79,140,255,.18)">三副本</span>';
+    }
   } catch (e) {
     body.innerHTML = `<div class="empty small">加载详情失败：${esc(e.message)}</div>`;
   }

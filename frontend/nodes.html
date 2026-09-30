@@ -17,6 +17,13 @@
   .node-kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:12px; }
   .node-kv .k { color:var(--muted); }
   .node-kv .v { font-family:var(--mono); }
+  .ec-mini { display:inline-block; min-width:24px; text-align:center; margin:1px;
+             padding:1px 3px; border-radius:4px; font-size:10.5px; font-family:var(--mono);
+             border:1px solid var(--border); }
+  .ec-mini.data { color:#a9c6ff; border-color:rgba(79,140,255,.45); }
+  .ec-mini.parity { color:#9be8c0; border-color:rgba(47,191,113,.45); }
+  .ec-mini.bad { color:#ff9c97; border-color:var(--bad); background:rgba(229,83,75,.12); }
+  tr.ec-row td { background:rgba(47,191,113,.03); }
 </style>
 </head>
 <body>
@@ -97,8 +104,8 @@ function renderSummary(d) {
     { label: "节点", value: `${d.summary.live}/${d.summary.total}`, sub: `DEAD ${d.summary.dead} · SUSPECT ${d.summary.suspect}`, cls: d.summary.dead ? "bad" : "ok" },
     { label: "欠副本块", value: h.under_replicated, sub: "低于期望副本数", cls: h.under_replicated ? "warn" : "ok" },
     { label: "损坏副本", value: h.corrupt_replicas, sub: "校验和不匹配", cls: h.corrupt_replicas ? "bad" : "ok" },
-    { label: "丢失块", value: h.missing_blocks, sub: "无任何可用副本", cls: h.missing_blocks ? "bad" : "ok" },
-    { label: "调度中", value: h.scheduled, sub: "已下发复制命令", cls: h.scheduled ? "accent" : "" },
+    { label: "EC 退化组", value: h.ec_degraded || 0, sub: `分片重建中 ${h.ec_repairing || 0}`, cls: h.ec_degraded ? "warn" : "ok" },
+    { label: "丢失", value: (h.missing_blocks || 0) + (h.ec_missing ? "/" + h.ec_missing : ""), sub: "块/EC组不可用", cls: (h.missing_blocks || h.ec_missing) ? "bad" : "ok" },
   ];
   document.getElementById("sum-row").innerHTML = cells.map(c => `
     <div class="kpi ${c.cls}">
@@ -130,7 +137,7 @@ function renderCards(d) {
         <i style="width:${pct}%"></i></div>
       <div class="node-kv">
         <span class="k">容量</span><span class="v">${fmtBytes(st.used)} / ${fmtBytes(st.capacity)}（${pct.toFixed(1)}%）</span>
-        <span class="k">块数</span><span class="v">${n.nn_block_count}（表内） · 损坏 ${n.corrupt}</span>
+        <span class="k">块数</span><span class="v">${n.nn_block_count} 副本块 · ${n.nn_shard_count || 0} EC 分片 · 损坏 ${n.corrupt}</span>
         <span class="k">心跳</span><span class="v">${n.state === "DEAD" ? `<span style="color:var(--bad)">失联 ${silent.toFixed(1)}s</span>` : silent.toFixed(1) + "s 前"} · 共 ${n.hb_count} 次</span>
         <span class="k">IO</span><span class="v">读 ${(n.io.reads || 0)} / 写 ${(n.io.writes || 0)} · ${fmtBytes((n.rates || {}).read || 0)}/s ↗ ${(n.rates || {}).write ? fmtBytes(n.rates.write) : "0"}/s</span>
         <span class="k">复制</span><span class="v">流入 ${n.io.replicate_in || 0} · 流出 ${n.io.replicate_out || 0} · 巡检 ${n.io.scrubbed || 0}</span>
@@ -157,14 +164,15 @@ async function showBlocks(node) {
   const d = await api("GET", `/api/nodes/blocks?node=${encodeURIComponent(node)}&limit=120`);
   const body = document.createElement("div");
   body.innerHTML = `
-    <div class="small muted" style="margin-bottom:8px">${esc(node)} 共 ${d.total} 个块（最新 120）</div>
+    <div class="small muted" style="margin-bottom:8px">${esc(node)} 共 ${d.total} 个块/分片（最新 120）</div>
     <div class="table-wrap scroll-y" style="max-height:52vh">
-    <table class="tbl"><thead><tr><th>块</th><th>genstamp</th><th class="right">大小</th><th>状态</th><th>校验和</th><th>写入时间</th><th></th></tr></thead>
+    <table class="tbl"><thead><tr><th>块/分片</th><th>genstamp</th><th class="right">大小</th><th>类型</th><th>状态</th><th>校验和</th><th>写入时间</th><th></th></tr></thead>
     <tbody>${d.blocks.map(b => `
       <tr>
-        <td class="mono small">${esc(b.id.slice(-10))}</td>
+        <td class="mono small">${esc(b.id.slice(-12))}</td>
         <td class="num">#${b.genstamp}</td>
         <td class="num right">${fmtBytes(b.size)}</td>
+        <td>${b.ec_group ? `<span class="badge ${b.ec_kind === "parity" ? "ok" : ""} plain" style="font-size:10px">${b.ec_kind === "data" ? "D" : "P"}${b.ec_index}</span>` : '<span class="dim small">副本</span>'}</td>
         <td>${b.state === "ok" ? '<span class="badge ok plain">ok</span>' : '<span class="badge bad plain">corrupt</span>'}</td>
         <td class="mono small muted">${esc(b.checksum)}…</td>
         <td class="small dim">${fmtTs(b.stored_at)}</td>
@@ -188,15 +196,31 @@ async function loadMatrix() {
   const box = document.getElementById("matrix-box");
   box.innerHTML = `
     <table class="matrix">
-      <thead><tr><th style="text-align:left">块</th><th>大小</th><th>副本</th>
+      <thead><tr><th style="text-align:left">块 / EC组</th><th>类型</th><th>大小</th><th>副本/分片</th>
         ${d.nodes.map(n => `<th>${esc(n)}</th>`).join("")}<th>状态</th><th></th></tr></thead>
       <tbody>
         ${d.rows.map((r, ri) => `
-          <tr>
+          <tr class="${r.kind === "ec" ? "ec-row" : ""}">
             <td class="blk mono" title="${esc(r.block)}">${esc(r.short)}</td>
+            <td>${r.kind === "ec"
+              ? `<span class="badge ok plain">EC ${esc(r.profile || (r.k + "+" + r.m))}</span>`
+              : '<span class="badge dim plain">3×</span>'}</td>
             <td>${fmtBytes(r.size)}</td>
-            <td>${r.live}/${r.desired}</td>
+            <td>${r.kind === "ec"
+              ? `<span class="mono">${r.live}/${r.desired}</span>`
+              : `${r.live}/${r.desired}`}</td>
             ${d.nodes.map(n => {
+              if (r.kind === "ec") {
+                const cell = r.cells[n] || { shards: [] };
+                const shs = cell.shards || [];
+                if (!shs.length) return `<td class="c-none cell" data-r="${ri}" data-n="${esc(n)}"><span class="muted">·</span></td>`;
+                return `<td class="cell ec-cell ${shs.some(s => s.state !== "ok") ? "c-corrupt" : "c-ok"}"
+                          data-r="${ri}" data-n="${esc(n)}"
+                          style="cursor:${caps.includes("sim") ? "pointer" : "default"}"
+                          title="${esc(n)}: ` + shs.map(s => `分片${s.index}(${s.kind}) ${s.state}`).join(", ") + `">
+                          ${shs.map(s => `<span class="ec-mini ${s.kind} ${s.state !== "ok" || !s.live ? "bad" : ""}"
+                              data-sid="${esc(s.sid)}">${s.kind === "data" ? "D" : "P"}${s.index}</span>`).join("")}</td>`;
+              }
               const c = r.cells[n] || "-";
               const glyph = c === "ok" ? "●" : c === "corrupt" ? "✕" : c === "stale" ? "◌" : "·";
               return `<td class="c-${c === "-" ? "none" : c} cell" data-r="${ri}" data-n="${esc(n)}"
@@ -204,8 +228,9 @@ async function loadMatrix() {
                         title="${esc(n)}: ${esc(c)}">${glyph}</td>`;
             }).join("")}
             <td>${r.status === "ok" ? '<span class="badge ok plain">健康</span>' :
-                  r.status === "under" ? '<span class="badge warn plain">欠副本</span>' :
-                  '<span class="badge bad plain">丢失</span>'}</td>
+                  r.status === "under" || r.status === "degraded" ? '<span class="badge warn plain">' +
+                    (r.status === "degraded" ? "退化" : "欠副本") + '</span>' :
+                  '<span class="badge bad plain">' + (r.status === "missing" ? "丢失" : r.status) + '</span>'}</td>
             <td><button class="btn xs ghost m-paths" data-b="${esc(r.block)}">引用</button></td>
           </tr>`).join("")}
       </tbody>
@@ -214,6 +239,18 @@ async function loadMatrix() {
     if (!caps.includes("sim")) return;
     const r = matrixData.rows[+td.dataset.r];
     const node = td.dataset.n;
+    if (r.kind === "ec") {
+      const cell = r.cells[node] || { shards: [] };
+      const goodSh = (cell.shards || []).find(s => s.state === "ok" && s.live);
+      if (!goodSh) return;
+      confirmDlg(`向 ${node} 上的 EC 分片 ${goodSh.kind === "data" ? "D" : "P"}${goodSh.index}（组 ${r.short}）注入静默损坏？`,
+        async () => {
+          try { await api("POST", "/api/sim/corrupt", { block_id: goodSh.sid, node_id: node });
+                toast("已注入分片损坏，等待自动重建", "warn"); }
+          catch (e) { toast(e.message, "bad"); }
+        }, true);
+      return;
+    }
     if ((r.cells[node] || "-") !== "ok") return;
     confirmDlg(`向 ${node} 上的块 ${r.short} 注入静默损坏？\n（数据字节被翻转，校验和不变——等待巡检或读取时发现）`,
       async () => {
@@ -242,7 +279,29 @@ async function loadQueue() {
       <span class="badge ${corrupt.length ? "bad" : "ok"}">损坏 ${q.counts.corrupt}</span>
       <span class="badge ${q.counts.missing ? "bad" : "ok"}">丢失 ${q.counts.missing}</span>
       <span class="badge ${q.counts.scheduled ? "acc" : "dim"}">调度中 ${q.counts.scheduled}</span>
+      <span class="badge ${q.counts.ec_degraded ? "warn" : "ok"}">EC退化 ${q.counts.ec_degraded || 0}</span>
+      <span class="badge ${q.counts.ec_repairing ? "acc" : "dim"}">EC重建 ${q.counts.ec_repairing || 0}</span>
     </div>
+    ${(q.ec_groups || []).length ? `
+    <div style="margin:8px 0">
+      <div class="small muted" style="margin:4px 0">EC 分片自动修复（k+m 中坏任意 m 个可还原）</div>
+      <div class="table-wrap scroll-y" style="max-height:200px">
+      <table class="tbl"><thead><tr><th>EC 组</th><th>方案</th><th>好分片</th>
+        <th style="min-width:130px">重建进度</th><th>目标节点</th></tr></thead>
+      <tbody>${(q.ec_groups || []).map(g => {
+        const pct = g.total ? Math.round(g.finished / g.total * 100) : 0;
+        return `<tr>
+          <td class="mono small" title="${esc(g.group)}">${esc(g.group.slice(-10))}</td>
+          <td>RS ${esc(g.profile || (g.k + "+" + g.m))}</td>
+          <td><span class="badge ${g.live < g.k ? "bad" : "warn"} plain">${g.live}/${g.desired}</span></td>
+          <td>${g.total ? `<div class="pbar thin" style="margin:2px 0"><i style="width:${pct}%"></i></div>
+             <span class="small mono">${g.finished}/${g.total} (${pct}%)</span>
+             <span class="small dim">缺[${(g.missing||[]).join(",")}]</span>`
+             : '<span class="muted small">等待调度</span>'}</td>
+          <td class="small mono">${(g.targets || []).join(",") || "—"}</td>
+        </tr>`;
+      }).join("")}</tbody></table></div>
+    </div>` : ""}
     ${under.length ? `
     <div class="table-wrap scroll-y" style="max-height:220px">
     <table class="tbl"><thead><tr><th>块</th><th>副本</th><th class="right">大小</th><th>发现于</th><th>尝试</th><th>调度</th></tr></thead>
@@ -254,7 +313,8 @@ async function loadQueue() {
         <td class="small dim">${fmtAgo(u.since)}</td>
         <td class="num">${u.attempts}</td>
         <td class="small mono">${u.scheduled ? `${esc(u.scheduled.src)} → ${esc((u.scheduled.dst || []).join(","))}` : '<span class="muted">待调度</span>'}</td>
-      </tr>`).join("")}</tbody></table></div>` : '<div class="empty small">队列清空：所有块副本齐全 🎉</div>'}
+      </tr>`).join("")}</tbody></table></div>`
+      : (!(q.ec_groups || []).length) ? '<div class="empty small">队列清空：所有副本与 EC 分片齐全 🎉</div>' : ""}
     ${corrupt.length ? `<div class="small" style="margin-top:10px">
       ${corrupt.map(([k, v]) => `<span class="badge bad plain" title="${esc(v.reason || "")} · ${fmtTs(v.ts)}">${esc(k.slice(-16))}</span>`).join(" ")}</div>` : ""}`;
 }

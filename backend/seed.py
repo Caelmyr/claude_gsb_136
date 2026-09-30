@@ -429,6 +429,31 @@ def seed_cluster(nn, datanodes=None, verbose=True):
     say("生成历史访问热度与吞吐数据 …")
     _seed_stats(nn)
 
+    # ------------------------------------------------------------------
+    # 纠删码演示：/cold-archive 冷归档目录采用 RS(2,1)（3 节点可落），
+    # 与默认三副本在同一棵目录树下并存、互不干扰。
+    # ------------------------------------------------------------------
+    say("写入纠删码（EC）演示文件 …")
+    nn.fs.mkdir("/", "cold-archive", "admin")
+    nn.set_redundancy_policy("/cold-archive", "ec", "2+1",
+                             recursive=False, user="admin")
+    cold_log = _big_log_file(lines=2600)
+    nn.write_file_internal("/cold-archive/cluster-archive.log",
+                           cold_log.encode(), "system")
+    # 较大的二进制冷备（多 EC 条带组，便于观察分片分布）
+    cold_blob = os.urandom(2 * 1024 * 1024 + 12345)
+    nn.write_file_internal("/cold-archive/blob-cold-2mb.bin", cold_blob,
+                           "admin")
+    nn.write_file_internal("/cold-archive/retention-policy.md",
+                           "# 冷归档策略\n\n本目录采用 RS(2,1) 纠删码：\n"
+                           "每个 64KiB 块拆成 2 个数据分片 + 1 个校验分片，\n"
+                           "分散到 3 个节点；空间开销 1.5×（三副本为 3×），\n"
+                           "任意 1 个分片损坏都能由其余分片还原。\n".encode(),
+                           "admin")
+    nn.versions.commit("feat(storage): /cold-archive 启用 RS(2,1) 纠删码",
+                       "admin")
+    say("  写入 3 个 EC 文件（与三副本并存）")
+
     say("注入历史日志 …")
     _seed_logs(nn)
 

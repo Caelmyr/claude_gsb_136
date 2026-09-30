@@ -170,11 +170,18 @@ def api_sessions(ctx):
 # ============================================================================
 
 def _annotate_health(nn, entries):
-    """给目录列表中的文件补充副本健康度。"""
+    """给目录列表中的文件补充副本/EC 健康度与实际冗余方式。"""
     with nn.meta.lock:
-        blocks = nn.meta.get("blocks")["blocks"]
+        blocks_doc = nn.meta.get("blocks")
+        blocks = blocks_doc["blocks"]
+        groups = blocks_doc.get("groups", {})
         for e in entries:
             if e["type"] != "file":
+                inode = nn.fs.get_inode(e["id"])
+                if inode and inode["type"] == "dir":
+                    pol, prof = nn._policy_for_inode(inode)
+                    e["redundancy"] = pol
+                    e["ec_profile"] = prof if pol == "ec" else None
                 continue
             inode = nn.fs.get_inode(e["id"])
             if not inode:
@@ -182,6 +189,16 @@ def _annotate_health(nn, entries):
             worst = "ok"
             live_min = None
             for bid in inode.get("block_ids", []):
+                if bid in groups:
+                    g = groups[bid]
+                    live_n, _gi, _c = nn.ec_live_shards(g)
+                    live_min = live_n if live_min is None \
+                        else min(live_min, live_n)
+                    if live_n < g["k"]:
+                        worst = "missing"
+                    elif live_n < g["k"] + g["m"] and worst != "missing":
+                        worst = "under"
+                    continue
                 blk = blocks.get(bid)
                 if not blk:
                     worst = "missing"
@@ -195,6 +212,9 @@ def _annotate_health(nn, entries):
                     worst = "under"
             e["health"] = worst
             e["live_replicas"] = live_min
+            kind, profile = nn.file_redundancy(inode)
+            e["redundancy_actual"] = kind
+            e["ec_profile"] = profile
     return entries
 
 
@@ -291,6 +311,44 @@ def api_file_blocks(ctx):
     path = ctx.query.get("path", "")
     ctx.require_perm(path, "read")
     return ctx.nn.file_blocks_detail(path)
+
+
+# ============================================================================
+# API: 冗余方式（三副本 / 纠删码）
+# ============================================================================
+
+@route("GET", "/api/redundancy/overview")
+def api_redundancy_overview(ctx):
+    return ctx.nn.redundancy_overview()
+
+
+@route("GET", "/api/redundancy/dirs")
+def api_redundancy_dirs(ctx):
+    return {"dirs": ctx.nn.redundancy_dirs(),
+            "profiles": config.EC_PROFILES,
+            "default_profile": config.EC_PROFILE_DEFAULT}
+
+
+@route("POST", "/api/redundancy/policy")
+def api_redundancy_policy(ctx):
+    body = ctx.json()
+    path = body.get("path", "/")
+    redundancy = body.get("redundancy", config.DEFAULT_REDUNDANCY)
+    ctx.require_perm(path, "write")
+    recursive = bool(body.get("recursive"))
+    result = ctx.nn.set_redundancy_policy(
+        path, redundancy, body.get("ec_profile"), recursive, ctx.actor())
+    return result
+
+
+@route("GET", "/api/redundancy/conversions")
+def api_redundancy_conversions(ctx):
+    return ctx.nn.conversion_jobs()
+
+
+@route("GET", "/api/redundancy/conversion/<job_id>")
+def api_redundancy_conversion_detail(ctx):
+    return ctx.nn.conversion_detail(ctx.params["job_id"])
 
 
 # ============================================================================

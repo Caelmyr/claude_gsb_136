@@ -114,7 +114,7 @@ function renderKpis(ov) {
   const cells = [
     { label: "逻辑数据量", value: fmtBytes(ov.logical_bytes), sub: `${ov.files} 个文件 / ${ov.dirs} 个目录`, cls: "accent" },
     { label: "物理占用", value: fmtBytes(ov.physical_bytes), sub: `副本放大 ×${ov.replication_overhead}`, cls: "" },
-    { label: "数据块", value: ov.blocks, sub: `块大小 ${fmtBytes(64 * 1024)}（定长）`, cls: "" },
+    { label: "数据块", value: ov.blocks, sub: `EC 条带组 ${ov.ec_groups || 0}（退化 ${ov.ec_degraded || 0}）`, cls: "" },
     { label: "集群容量", value: fmtBytes(ov.capacity), sub: `${ov.nodes_live}/${ov.nodes_total} 节点在线`, cls: ov.nodes_dead ? "warn" : "ok" },
     { label: "回收站", value: fmtBytes(ov.trash.bytes), sub: `${ov.trash.count} 项 · 保留 ${ov.trash.retention_days} 天`, cls: "" },
   ];

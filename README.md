@@ -43,16 +43,17 @@ python3 -m backend.datanode --id dn5 --port 8025
 
 ---
 
-## 2. 前端页面（11 个，要求 10 个 + 仪表盘）
+## 2. 前端页面（12 个，要求 10 个 + 仪表盘）
 
 | 页面 | 文件 | 内容 |
 |---|---|---|
 | 仪表盘 | `index.html` | KPI / 容量水位 / 最近提交 / 事件流 / 热点 TOP |
-| 文件浏览 | `files.html` | 目录树 + 缩略图网格 + 面包屑 + 块/副本详情抽屉 + 文本预览 |
+| 文件浏览 | `files.html` | 目录树 + 缩略图网格 + 面包屑 + 块/副本/**EC 分片**详情抽屉 + 文本预览 |
 | 上传下载 | `transfer.html` | 分块上传（分片可视化、暂停/续传/混沌模式）、Range 分段下载（断点续传、sha256 校验、副本命中统计） |
 | 版本历史 | `versions.html` | 提交时间线（泳道）、分支管理、提交/合并/检出、冲突展示、文件级历史与回滚 |
 | 差异对比 | `diff.html` | 版本 diff + 文本 diff 双模式、Myers/Patience/difflib 选择、unified/双栏视图、行内字符级高亮、大文件性能试验台 |
-| 节点状态 | `nodes.html` | 节点卡片（心跳/容量/IO/版本向量）、块×节点副本矩阵、恢复队列、杀死/复活/注入损坏演练、实时事件流 |
+| 节点状态 | `nodes.html` | 节点卡片（心跳/容量/IO/版本向量）、块×节点副本/**EC 分片**矩阵、恢复队列（含分片重建进度）、杀死/复活/注入损坏演练、实时事件流 |
+| **冗余策略** | `redundancy.html` | **三副本 vs 纠删码（RS k+m）总览、按目录切换冗余方式、后台无损转换任务进度、EC 分片自动修复队列** |
 | 存储统计 | `stats.html` | 容量 donut、副本数分布、块大小直方图、24h 吞吐、容量趋势、类型分布、热度榜（sparkline）、元数据文档表 |
 | 用户管理 | `users.html` | 用户 CRUD、角色能力矩阵、活动会话与吊销 |
 | 权限设置 | `permissions.html` | 路径前缀 ACL 规则编辑器、默认策略、**判定轨迹测试器** |
@@ -61,6 +62,23 @@ python3 -m backend.datanode --id dn5 --port 8025
 
 共享样式 `frontend/css/app.css`（暗色设计系统），共享脚本 `frontend/js/app.js`
 （令牌管理、API 封装、导航、吐司/弹窗、SVG 图表库）。
+
+### 2.1 两种冗余方式：三副本 vs 纠删码
+
+| | 三副本（rep，默认） | 纠删码（ec，Reed-Solomon） |
+|---|---|---|
+| 原理 | 整块复制 3 份 | 块拆 **k 个数据分片 + m 个校验分片**，分散到 k+m 个节点 |
+| 空间开销 | 3× | (k+m)/k（如 RS(2,1)=1.5×、RS(2,2)=2×） |
+| 容错 | 坏 2 份仍可读 | 任意 m 个分片损坏都能由其余分片 RS 解码还原 |
+| 修复 | 拉取整份副本拷贝 | NameNode 取 k 个存活分片在线重建缺失/损坏分片 |
+| 适用 | 热数据 | 冷归档、省空间 |
+
+* 策略**按目录**设置并沿目录树就近继承（根默认三副本）；子目录可覆盖；
+* 切换目录策略时可对已有文件做**后台转换**：写新冗余块 → 原子替换 inode 引用，
+  旧块保留（历史版本可读、GC 宽限期后回收），**切换期间读写不中断**；
+* 未转换的旧文件维持原方式 —— **同一目录下两种冗余并存、互不干扰**；
+* 文件浏览/节点页可查每个文件的冗余方式、每个分片落在哪个节点及自动修复进度；
+* RS 编解码见 `backend/reed_solomon.py`（GF(2^8) Cauchy 系统 MDS 码，纯标准库）。
 
 ---
 
@@ -75,7 +93,8 @@ python3 -m backend.datanode --id dn5 --port 8025
 │  NameNode :8020 （backend/namenode.py + http_server.py）                  │
 │   · 元数据 9 个 JSON 文档：fs/blocks/versions/users/perms/                │
 │     logs/recycle/stats/cluster   —— 原子写 + 版本向量                     │
-│   · 块表（genstamp/校验和/副本位置）、放置策略、恢复调度、GC                │
+│   · 块表（genstamp/校验和/副本位置）、EC 条带组（k+m 分片位置/重建）、
+│     放置策略、恢复调度、GC、目录冗余策略与后台转换                          │
 │   · 上传会话（断点续传暂存）、Range 读路径（副本轮询+故障转移）              │
 │   · 版本树 VersionStore（提交/分支/merge/checkout）                        │
 └──────┬───────────────────────────────────────────────────▲───────────────┘
@@ -159,6 +178,30 @@ data/datanodes/<node_id>/doc_cache/*.json   # DN 同步到的元数据文档
 * **锁序纪律**：全局固定 meta → node → health → cmd，
   心跳注册/复活等路径在锁外执行副作用，避免 ABBA 死锁。
 
+### 4.6 纠删码：数据分片 + 校验分片（reed_solomon.py + namenode.py）
+* **编码**：块按 k 等分成数据分片 D0..D{k-1}（末片零填充到统一条带 stripe），
+  用 `[单位阵 I | Cauchy 校验矩阵]` 点乘 GF(256) 条带生成 m 个校验分片；
+  Cauchy 构造保证**任意 k 行都可逆（MDS）** ⇒ 任意 m 个分片损坏可还原。
+* **重建**：任取 k 个存活分片（含校验分片），对应 k×k 子矩阵 GF(256)
+  高斯-约旦求逆 → 解出全部数据分片 → 再点乘编码矩阵行得到缺失分片。
+  `reed_solomon.py` 对 (2,1)/(2,2)/(3,2)/(6,3) 等方案枚举过所有
+  「恰好 k 个存活分片」组合验证还原一致。
+* **放置**：k+m 个分片各 PUT 到不同节点（沿用跨机架/剩余空间排序），
+  节点不足 k+m 时缺失分片临时与其它分片同节点放置，节点扩容/复活后
+  由**重平衡**（MRV 完美匹配）迁回独立节点并清理多余副本。
+* **读路径**：优先取 k 个数据分片直拼（免编码），含校验分片或缺片时
+  RS 重建；逐分片 sha256 校验，失败自动故障转移到同名其它分片。
+* **自动修复**：块汇报/scrub/读校验发现分片损坏或节点故障导致存活分片
+  < k+m（但 ≥ k）即进入退化队列，NameNode 调度工作线程在线重建并 PUT
+  到新节点，页面可查每组 `finished/total` 进度；< k 标记不可解码，
+  等节点复活（磁盘分片经块汇报重新挂上）后恢复。
+* **目录切换**：冗余策略记在目录 inode 上、子树就近继承；转换任务
+  「读旧块→按新冗余写新块→原子换引用」，旧块保留给版本快照与 GC 宽限，
+  全程读写不中断；新文件按新策略、未转旧文件维持原方式（同目录并存）。
+* **对账一致性**：分片经全量块汇报对账时，连续两次汇报缺失才从 NN 摘除
+  （避免 PUT 与汇报快照并发把刚落盘的好分片误判丢失），损坏/孤儿分片
+  下发删除；GC 同时回收三副本块与 EC 组分片。
+
 ---
 
 ## 5. REST API 摘要（节选）
@@ -173,6 +216,8 @@ GET  /api/version/branches|commits|graph|diff|working_diff|file_at|history|stats
 POST /api/version/commit|branch|branch_delete|checkout|merge|restore|diff_text
 GET  /api/nodes|nodes/blocks|nodes/matrix|nodes/block_paths
 GET  /api/health/queue           GET /api/sim/events
+GET  /api/redundancy/overview|dirs
+POST /api/redundancy/policy      GET /api/redundancy/conversions|conversion/<id>
 POST /api/sim/kill|revive|corrupt|chaos                （admin）
 GET  /api/stats/overview|hotness|timeline
 GET|POST /api/users  PUT|DELETE /api/users/<name>      （user_admin）
@@ -194,17 +239,18 @@ gsb4/
 │   ├── config.py              # 全部可调参数（块大小/副本/心跳/保留期…）
 │   ├── util.py                # 原子写/版本向量/HTTP 客户端/LRU/环形缓冲
 │   ├── chunking.py            # 固定 + CDC 分块、清单、重组校验
+│   ├── reed_solomon.py        # GF(2^8) Cauchy RS 纠删码：编码/任意 k 分片重建
 │   ├── diff_engine.py         # Myers / Patience / merge3 / 渲染器
 │   ├── metadata.py            # JSON 文档仓库（原子写 + vv 同步语义）
 │   ├── auth.py                # 用户/口令/会话 + 路径 ACL
 │   ├── filesystem.py          # inode 树 + 回收站
 │   ├── versioning.py          # 提交/分支/合并/检出/GC 引用集
-│   ├── namenode.py            # 块表/放置/心跳/恢复/上传下载/统计/GC
+│   ├── namenode.py            # 块表/EC 条带组/放置/心跳/恢复/重建/冗余转换/上传下载/统计/GC
 │   ├── datanode.py            # 块存储/心跳/汇报/scrub/流水线/文档同步
 │   ├── http_server.py         # 路由 + 静态页 + 鉴权中间件
-│   ├── seed.py                # 演示数据（含冲突合并场景）
+│   ├── seed.py                # 演示数据（含冲突合并场景、EC 冷归档目录）
 │   └── main.py                # 集群装配
-├── frontend/                  # 11 页面 + css/app.css + js/app.js
+├── frontend/                  # 12 页面 + css/app.css + js/app.js
 └── tests/smoke_test.py        # 97 项端到端断言
 ```
 

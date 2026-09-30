@@ -347,6 +347,14 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .health-dot.ok { background: var(--ok); }
 .health-dot.under { background: var(--warn); }
 .health-dot.missing { background: var(--bad); }
+.fcard .red-badge {
+  position: absolute; top: 7px; left: 8px; z-index: 2;
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  padding: 1px 6px; border-radius: 5px; letter-spacing: .3px;
+  border: 1px solid transparent;
+}
+.fcard .red-badge.rep { color: #a9c6ff; background: rgba(79,140,255,.16); border-color: rgba(79,140,255,.4); }
+.fcard .red-badge.ec { color: #9be8c0; background: rgba(47,191,113,.14); border-color: rgba(47,191,113,.4); }
 
 /* ---------------------------------------------------------------- 时间线 */
 .timeline { position: relative; padding-left: 26px; }
